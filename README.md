@@ -21,6 +21,9 @@ and validated against a live OpenClaw 2026.6.10 installation.
 | Session keys | `agent:<id>:main`, `agent:<id>:telegram:direct:<peer>`, group variants |
 | Startup context | Recent daily memory (`memory/YYYY-MM-DD*.md`, today+yesterday) prepended one-shot on fresh sessions |
 | Skills | `skills/**/SKILL.md` discovered from the workspace and injected as the npm-style `<available_skills>` list (name/description from frontmatter, location, sha256 version); the model loads a skill on demand with `read` |
+| Cron | Jobs stored in npm's canonical `cron_jobs`/`cron_run_logs` tables in `state/openclaw.sqlite` (same `store_key`, full `job_json`); schedule kinds `at`/`every`/`cron` with npm next-run semantics; isolated or session-targeted `agentTurn`/`systemEvent` payloads; `announce` delivery to telegram; `cron` agent tool (status/list/add/remove/run) + CLI |
+| Heartbeat | npm defaults: on for the default agent, every 30m, `HEARTBEAT_OK` ack suppression (≤30 char leftover), skip when HEARTBEAT.md is effectively empty; delivery via `agents.defaults.heartbeat.to` (e.g. `telegram:<peer>`) |
+| Subagents | `sessions_spawn` tool spawns isolated child sessions (`agent:<id>:subagent:<uuid>`), records runs in npm's `subagent_runs` table, announces completion back to the requester's telegram chat; `subagents` tool + CLI list |
 | Tools | `exec` (shell in workspace, `tools.exec.security: full` semantics), `read`, `write`, `memory_search`, `memory_get`, `web_search`, `web_fetch`, `session_status` (live clock + session/model info, like npm's status card) |
 | Web search | Brave Search API (key from `plugins.entries.brave.config.webSearch.apiKey`, same as the npm brave plugin) with a self-contained SearXNG fallback — point `plugins.entries.searxng.config.url` or `OPENCLAW_SEARXNG_URL` at any instance with `format=json` enabled; `web_fetch` reduces pages to readable text |
 | Images | Inbound Telegram photos are saved to `<workspace>/media/inbound/` and forwarded as npm-format image parts (`{type:"image", data, mimeType}`) to vision models on all three provider dialects; CLI: `agent --image <file>`; vision turns route to `--image-model` / `agents.defaults.imageModel.primary` |
@@ -78,13 +81,36 @@ openclaw-rs agent --model ollama-localhost/ornith-1.0-9b-q4 -m "hi"
 > `docs/COMPAT.md`) — Ollama's default 4096 context silently truncates the
 > OpenClaw bootstrap prompt and breaks tool calling and image input.
 
-Run the Telegram bot fully locally (text on Ornith, photos on a local
-vision model such as Gemma 4 E2B):
+Run the daemon fully locally — Telegram channel + cron scheduler + heartbeat
+(text on Ornith, photos on a local vision model such as Gemma 4 E2B):
 
 ```bash
 openclaw-rs telegram --model ollama-localhost/ornith-1.0-9b-q4 \
                      --image-model ollama-localhost/gemma4-e2b-24k
+# --no-cron / --no-heartbeat to disable those loops
 ```
+
+### Console management (cron & subagents)
+
+```bash
+openclaw-rs cron list                          # jobs with next/last run
+openclaw-rs cron add --name morning-brief \
+    --schedule cron:'0 8 * * *' \
+    --message "Summarize my memo.md todos" \
+    --deliver-to telegram:123456789            # announce to a chat
+openclaw-rs cron add --name remind-once --once \
+    --schedule at:2026-07-12T01:00:00Z --message "..."
+openclaw-rs cron run <jobId>                   # force-run now
+openclaw-rs cron runs                          # recent run log
+openclaw-rs cron rm <jobId>
+openclaw-rs subagents [--recent 60] [--json]   # sub-agent runs + results
+openclaw-rs watch                              # live dashboard (2s refresh)
+```
+
+The agent can manage the same jobs from chat via the `cron` tool
+("remind me tomorrow at 9 to ...") and spawn background workers via
+`sessions_spawn`; both write the same SQLite stores the npm gateway uses,
+so `openclaw cron list` / the Control UI see them too.
 
 > **Warning:** do not run `openclaw-rs telegram` while the npm gateway is also
 > polling the same bot token — Telegram allows only one getUpdates consumer and
@@ -97,8 +123,8 @@ core runtime loop and the full on-disk contract; it does not yet implement:
 
 - the Gateway WebSocket server / Control UI / webchat (protocol documented in
   `docs/COMPAT.md`; the CLI here runs embedded turns instead)
-- skills, plugins, hooks, cron, subagents, sessions_spawn, compaction,
-  heartbeats, commitments, dreaming, browser/canvas/nodes tools
+- plugins, hooks, compaction, commitments, dreaming, browser/canvas/nodes
+  tools; cron `command`/`on-exit` payloads and webhook delivery
 - image generation (image input works; generation does not), audio/voice
 - provider streaming (requests are non-streaming; npm always streams),
   embedding-based hybrid memory search (keyword/FTS parity only),

@@ -1,10 +1,13 @@
 mod agent;
 mod config;
+mod cron;
+mod heartbeat;
 mod memory;
 mod paths;
 mod prompt;
 mod providers;
 mod sessions;
+mod subagents;
 mod telegram;
 mod tools;
 mod websearch;
@@ -67,7 +70,7 @@ enum Command {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
-    /// Run the Telegram channel (long-polling).
+    /// Run the daemon: Telegram channel + cron scheduler + heartbeat.
     Telegram {
         /// Override model as provider/model-id for all telegram replies.
         #[arg(long)]
@@ -75,6 +78,67 @@ enum Command {
         /// Model to use for turns that contain a photo (vision model).
         #[arg(long)]
         image_model: Option<String>,
+        /// Disable the cron scheduler in this daemon.
+        #[arg(long)]
+        no_cron: bool,
+        /// Disable the heartbeat loop (enabled by default, npm parity;
+        /// interval from agents.defaults.heartbeat.every, default 30m).
+        #[arg(long)]
+        no_heartbeat: bool,
+    },
+    /// Manage scheduled cron jobs (console).
+    Cron {
+        #[command(subcommand)]
+        cmd: CronCmd,
+    },
+    /// Inspect sub-agent runs (console).
+    Subagents {
+        /// Only show runs from the last N minutes.
+        #[arg(long)]
+        recent: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Live console dashboard: cron jobs + subagent runs, refreshed every 2s.
+    Watch,
+}
+
+#[derive(Subcommand)]
+enum CronCmd {
+    /// List jobs with next/last run info.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a job: --name, --schedule (at:<rfc3339>|every:<dur>|cron:<expr>), --message.
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        schedule: String,
+        #[arg(long)]
+        message: String,
+        /// Announce target, e.g. telegram:123456789
+        #[arg(long)]
+        deliver_to: Option<String>,
+        /// Delete the job after one successful run.
+        #[arg(long)]
+        once: bool,
+        /// Run inside an existing session key instead of isolated.
+        #[arg(long)]
+        session_key: Option<String>,
+        /// Model override for the job turn.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Remove a job by id.
+    Rm { job_id: String },
+    /// Run a job immediately.
+    Run { job_id: String },
+    /// Show recent run logs (optionally for one job).
+    Runs {
+        #[arg(long)]
+        job_id: Option<String>,
     },
 }
 
@@ -95,6 +159,10 @@ pub struct Runtime {
     pub paths: paths::StatePaths,
     pub loaded: config::LoadedConfig,
     pub agent_id: String,
+    /// Handles of spawned subagent tasks. One-shot CLI commands drain these
+    /// before exit so spawned work is not killed with the process; the
+    /// daemon lets them run detached.
+    pub spawned: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Runtime {
@@ -106,7 +174,21 @@ impl Runtime {
             paths: state,
             loaded,
             agent_id: agent_id.to_string(),
+            spawned: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Wait for all spawned subagent tasks (used by one-shot CLI commands).
+    pub async fn drain_spawned(&self) {
+        loop {
+            let handle = self.spawned.lock().unwrap().pop();
+            match handle {
+                Some(h) => {
+                    let _ = h.await;
+                }
+                None => break,
+            }
+        }
     }
 
     pub fn workspace(&self) -> PathBuf {
@@ -159,6 +241,7 @@ impl Runtime {
             memory: std::sync::Mutex::new(mem),
             web: websearch::WebTools::new(search_cfg),
             session,
+            runtime: None,
         })
     }
 
@@ -263,7 +346,7 @@ impl Runtime {
     }
 
     pub async fn run_message(
-        &self,
+        self: &std::sync::Arc<Self>,
         session_key: &str,
         text: &str,
         force_new: bool,
@@ -276,7 +359,7 @@ impl Runtime {
     /// Full variant: text plus npm-format image parts
     /// (`{type:"image", data:<base64>, mimeType}`).
     pub async fn run_message_parts(
-        &self,
+        self: &std::sync::Arc<Self>,
         session_key: &str,
         text: &str,
         image_parts: Vec<serde_json::Value>,
@@ -288,12 +371,13 @@ impl Runtime {
             !chain.is_empty(),
             "no model configured (agents.defaults.model.primary)"
         );
-        let tools_rt = self.tool_runtime(tools::SessionInfo {
+        let mut tools_rt = self.tool_runtime(tools::SessionInfo {
             agent_id: self.agent_id.clone(),
             session_key: session_key.to_string(),
             model_ref: chain[0].clone(),
             context_window: self.context_window_of(&chain[0]),
         })?;
+        tools_rt.runtime = Some(self.clone());
         let tool_names: Vec<String> = tools_rt.specs().iter().map(|t| t.name.clone()).collect();
         let system_prompt = self.build_prompt(&chain[0], tool_names);
         let (mut store, mut transcript, _sid, is_fresh) =
@@ -368,7 +452,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    let rt = Runtime::init(&cli.agent)?;
+    let rt = std::sync::Arc::new(Runtime::init(&cli.agent)?);
 
     match cli.command {
         Command::Status => {
@@ -416,6 +500,8 @@ async fn main() -> Result<()> {
                 .run_message_parts(&key, &message, images, new, model.as_deref())
                 .await?;
             println!("{reply}");
+            // Keep one-shot CLI alive until spawned subagents finish.
+            rt.drain_spawned().await;
         }
         Command::Chat { new, model } => {
             use std::io::{BufRead, Write};
@@ -493,7 +579,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Telegram { model, image_model } => {
+        Command::Telegram {
+            model,
+            image_model,
+            no_cron,
+            no_heartbeat,
+        } => {
             // Fall back to the configured agents.defaults.imageModel.primary.
             let cfg_image_model = rt
                 .loaded
@@ -502,8 +593,134 @@ async fn main() -> Result<()> {
                 .and_then(Value::as_str)
                 .map(String::from);
             let image_model = image_model.or(cfg_image_model);
-            telegram::run(&rt, model.as_deref(), image_model.as_deref()).await?;
+            if !no_cron {
+                tokio::spawn(cron::run_loop(rt.clone()));
+            }
+            if !no_heartbeat {
+                tokio::spawn(heartbeat::run_loop(rt.clone(), model.clone()));
+            }
+            telegram::run(rt.clone(), model.as_deref(), image_model.as_deref()).await?;
         }
+        Command::Cron { cmd } => {
+            let store = cron::CronStore::open(&rt.paths.root)?;
+            match cmd {
+                CronCmd::List { json } => {
+                    let jobs = store.list_jobs()?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&jobs)?);
+                    } else if jobs.is_empty() {
+                        println!("no cron jobs");
+                    } else {
+                        for j in &jobs {
+                            println!("{}", cron::format_job_line(j));
+                        }
+                    }
+                }
+                CronCmd::Add {
+                    name,
+                    schedule,
+                    message,
+                    deliver_to,
+                    once,
+                    session_key,
+                    model,
+                } => {
+                    let schedule = cron::parse_schedule_arg(&schedule)?;
+                    let job = cron::make_job(
+                        &rt.agent_id,
+                        &name,
+                        schedule,
+                        &message,
+                        session_key.as_deref(),
+                        deliver_to.as_deref(),
+                        once,
+                        model.as_deref(),
+                    );
+                    store.upsert_job(&job)?;
+                    println!(
+                        "added {} — next run: {}",
+                        job["id"].as_str().unwrap_or("?"),
+                        job["state"]["nextRunAtMs"]
+                            .as_i64()
+                            .or_else(|| cron::compute_next_run_ms(&job["schedule"], chrono::Utc::now().timestamp_millis()))
+                            .map(cron::fmt_ms)
+                            .unwrap_or_else(|| "-".into())
+                    );
+                }
+                CronCmd::Rm { job_id } => {
+                    println!("removed: {}", store.remove_job(&job_id)?);
+                }
+                CronCmd::Run { job_id } => {
+                    let Some(job) = store.get_job(&job_id)? else {
+                        anyhow::bail!("job not found: {job_id}");
+                    };
+                    drop(store);
+                    let started = chrono::Utc::now().timestamp_millis();
+                    let (status, summary, session_key) = cron::execute_job(&rt, &job).await;
+                    let duration = chrono::Utc::now().timestamp_millis() - started;
+                    let store = cron::CronStore::open(&rt.paths.root)?;
+                    store.finish_run(
+                        &job,
+                        &status,
+                        (status == "error").then_some(summary.as_str()),
+                        Some(&summary.chars().take(500).collect::<String>()),
+                        duration,
+                        &session_key,
+                    )?;
+                    println!("[{status}] {summary}");
+                }
+                CronCmd::Runs { job_id } => {
+                    for e in store.run_logs(job_id.as_deref(), 20)? {
+                        println!(
+                            "{}  {:8} job={} {}",
+                            e["ts"].as_i64().map(cron::fmt_ms).unwrap_or_default(),
+                            e["status"].as_str().unwrap_or("?"),
+                            e["jobId"].as_str().unwrap_or("?"),
+                            e["summary"].as_str().unwrap_or("").chars().take(80).collect::<String>(),
+                        );
+                    }
+                }
+            }
+        }
+        Command::Subagents { recent, json } => {
+            let store = subagents::SubagentStore::open(&rt.paths.root)?;
+            let runs = store.list(recent)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+            } else if runs.is_empty() {
+                println!("no subagent runs");
+            } else {
+                for r in &runs {
+                    println!("{}", subagents::format_run_line(r));
+                }
+            }
+        }
+        Command::Watch => loop {
+            let cron_store = cron::CronStore::open(&rt.paths.root)?;
+            let jobs = cron_store.list_jobs().unwrap_or_default();
+            let sub_store = subagents::SubagentStore::open(&rt.paths.root)?;
+            let runs = sub_store.list(Some(24 * 60)).unwrap_or_default();
+            print!("\x1B[2J\x1B[H"); // clear screen
+            println!(
+                "openclaw-rs watch — {}  (Ctrl-C to exit)\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+            );
+            println!("── cron jobs ({}) ──────────────────────────", jobs.len());
+            for j in &jobs {
+                println!("{}", cron::format_job_line(j));
+            }
+            if jobs.is_empty() {
+                println!("(none)");
+            }
+            println!("\n── subagent runs, last 24h ({}) ────────────", runs.len());
+            for r in &runs {
+                println!("{}", subagents::format_run_line(r));
+            }
+            if runs.is_empty() {
+                println!("(none)");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        },
     }
     Ok(())
 }

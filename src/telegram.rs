@@ -98,7 +98,7 @@ fn getrandom(buf: &mut [u8]) {
 }
 
 pub async fn run(
-    rt: &Runtime,
+    rt: std::sync::Arc<Runtime>,
     model_override: Option<&str>,
     image_model: Option<&str>,
 ) -> Result<()> {
@@ -309,6 +309,23 @@ async fn api(http: &reqwest::Client, base: &str, method: &str, body: Value) -> R
         bail!("telegram {method}: {}", resp["description"].as_str().unwrap_or("unknown error"));
     }
     Ok(resp)
+}
+
+/// Standalone delivery for cron/heartbeat/subagent announcements: send
+/// `text` to a telegram peer using the configured bot token.
+pub async fn deliver(rt: &Runtime, chat_id: i64, text: &str) -> Result<()> {
+    let Some(tg) = &rt.loaded.config.channels.telegram else {
+        bail!("telegram not configured");
+    };
+    let Some(token) = &tg.bot_token else {
+        bail!("telegram botToken missing");
+    };
+    let http = reqwest::Client::new();
+    let base = format!("https://api.telegram.org/bot{token}");
+    for chunk in split_message(text, 4000) {
+        send_message(&http, &base, chat_id, &chunk).await?;
+    }
+    Ok(())
 }
 
 async fn send_message(http: &reqwest::Client, base: &str, chat_id: i64, text: &str) -> Result<()> {

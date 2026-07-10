@@ -17,6 +17,9 @@ pub struct ToolRuntime {
     pub memory: std::sync::Mutex<MemoryIndex>,
     pub web: WebTools,
     pub session: SessionInfo,
+    /// Handle back to the runtime for tools that spawn work (sessions_spawn)
+    /// or manage stores (cron, subagents).
+    pub runtime: Option<std::sync::Arc<crate::Runtime>>,
 }
 
 /// Context surfaced by the session_status tool (npm parity: the status card
@@ -83,6 +86,48 @@ impl ToolRuntime {
                 }),
             },
             ToolSpec {
+                name: "cron".into(),
+                description: "Manage scheduled jobs. Actions: status, list, add, remove, run. For add: provide name, schedule (at:<rfc3339> | every:<duration like 30m> | cron:<expr>), message; optional deliverTo like telegram:<chatId>, deleteAfterRun for one-shot reminders, sessionKey to run in an existing session.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["status","list","add","remove","run"]},
+                        "jobId": {"type": "string"},
+                        "name": {"type": "string"},
+                        "schedule": {"type": "string", "description": "at:<rfc3339> | every:<dur> | cron:<expr>"},
+                        "message": {"type": "string", "description": "agent-turn prompt to run"},
+                        "deliverTo": {"type": "string", "description": "announce target, e.g. telegram:123456789"},
+                        "deleteAfterRun": {"type": "boolean"},
+                        "sessionKey": {"type": "string"}
+                    },
+                    "required": ["action"]
+                }),
+            },
+            ToolSpec {
+                name: "sessions_spawn".into(),
+                description: "Spawn a sub-agent to work on a task in its own isolated session. Completion is announced back automatically — do NOT poll for it. Returns the runId immediately.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string", "description": "full task instructions for the sub-agent"},
+                        "label": {"type": "string", "description": "short label for status displays"},
+                        "model": {"type": "string", "description": "optional provider/model override"}
+                    },
+                    "required": ["task"]
+                }),
+            },
+            ToolSpec {
+                name: "subagents".into(),
+                description: "List sub-agent runs and their status/results.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list"]},
+                        "recentMinutes": {"type": "number"}
+                    }
+                }),
+            },
+            ToolSpec {
                 name: "session_status".into(),
                 description: "Get the current date/time and session status (agent, session, model, workspace). Use this whenever you need the live clock.".into(),
                 parameters: json!({
@@ -140,6 +185,9 @@ impl ToolRuntime {
             "web_search" => self.web_search(args).await,
             "web_fetch" => self.web_fetch(args).await,
             "session_status" => Ok(self.session_status()),
+            "cron" => self.cron(args).await,
+            "sessions_spawn" => self.sessions_spawn(args),
+            "subagents" => self.subagents(args),
             other => Ok((json!({"error": format!("unknown tool: {other}")}), true)),
         }
     }
@@ -292,6 +340,115 @@ impl ToolRuntime {
 }
 
 impl ToolRuntime {
+    async fn cron(&self, args: &Value) -> Result<(Value, bool)> {
+        let Some(rt) = &self.runtime else {
+            return Ok((json!({"error":"cron unavailable in this context"}), true));
+        };
+        let store = crate::cron::CronStore::open(&rt.paths.root)?;
+        match args["action"].as_str() {
+            Some("status") | Some("list") => {
+                let jobs = store.list_jobs()?;
+                Ok((json!({"jobs": jobs, "count": jobs.len()}), false))
+            }
+            Some("add") => {
+                let (Some(name), Some(schedule), Some(message)) = (
+                    args["name"].as_str(),
+                    args["schedule"].as_str(),
+                    args["message"].as_str(),
+                ) else {
+                    return Ok((json!({"error":"add requires name, schedule, message"}), true));
+                };
+                let schedule = match crate::cron::parse_schedule_arg(schedule) {
+                    Ok(s) => s,
+                    Err(e) => return Ok((json!({"error": format!("{e:#}")}), true)),
+                };
+                // Default announce target: the requesting session's telegram peer.
+                let deliver_to = args["deliverTo"].as_str().map(String::from).or_else(|| {
+                    crate::subagents::telegram_peer_of(&self.session.session_key)
+                        .map(|p| format!("telegram:{p}"))
+                });
+                let job = crate::cron::make_job(
+                    &rt.agent_id,
+                    name,
+                    schedule,
+                    message,
+                    args["sessionKey"].as_str(),
+                    deliver_to.as_deref(),
+                    args["deleteAfterRun"].as_bool().unwrap_or(false),
+                    None,
+                );
+                store.upsert_job(&job)?;
+                Ok((json!({"ok": true, "jobId": job["id"], "nextRunAtMs": job["state"]["nextRunAtMs"]}), false))
+            }
+            Some("remove") => {
+                let Some(id) = args["jobId"].as_str() else {
+                    return Ok((json!({"error":"remove requires jobId"}), true));
+                };
+                Ok((json!({"removed": store.remove_job(id)?}), false))
+            }
+            Some("run") => {
+                let Some(id) = args["jobId"].as_str() else {
+                    return Ok((json!({"error":"run requires jobId"}), true));
+                };
+                let Some(job) = store.get_job(id)? else {
+                    return Ok((json!({"error": format!("job not found: {id}")}), true));
+                };
+                drop(store);
+                let started = chrono::Utc::now().timestamp_millis();
+                // Box::pin breaks the async recursion cycle
+                // (run_turn → dispatch → cron.run → execute_job → run_turn).
+                let (status, summary, session_key) =
+                    Box::pin(crate::cron::execute_job(rt, &job)).await;
+                let duration = chrono::Utc::now().timestamp_millis() - started;
+                let store = crate::cron::CronStore::open(&rt.paths.root)?;
+                store.finish_run(
+                    &job,
+                    &status,
+                    (status == "error").then_some(summary.as_str()),
+                    Some(&summary.chars().take(500).collect::<String>()),
+                    duration,
+                    &session_key,
+                )?;
+                Ok((json!({"status": status, "summary": summary}), status == "error"))
+            }
+            other => Ok((json!({"error": format!("unknown cron action: {other:?}")}), true)),
+        }
+    }
+
+    fn sessions_spawn(&self, args: &Value) -> Result<(Value, bool)> {
+        let Some(rt) = &self.runtime else {
+            return Ok((json!({"error":"sessions_spawn unavailable in this context"}), true));
+        };
+        let Some(task) = args["task"].as_str() else {
+            return Ok((json!({"error":"missing task"}), true));
+        };
+        // Child inherits the parent's active model unless explicitly overridden.
+        let model = args["model"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| self.session.model_ref.clone());
+        match crate::subagents::spawn(
+            rt.clone(),
+            self.session.session_key.clone(),
+            task.to_string(),
+            args["label"].as_str().map(String::from),
+            Some(model),
+        ) {
+            Ok(v) => Ok((v, false)),
+            Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
+        }
+    }
+
+    fn subagents(&self, args: &Value) -> Result<(Value, bool)> {
+        let Some(rt) = &self.runtime else {
+            return Ok((json!({"error":"subagents unavailable in this context"}), true));
+        };
+        let store = crate::subagents::SubagentStore::open(&rt.paths.root)?;
+        let recent = args["recentMinutes"].as_i64();
+        let runs = store.list(recent)?;
+        Ok((json!({"runs": runs, "count": runs.len()}), false))
+    }
+
     fn session_status(&self) -> (Value, bool) {
         let now_utc = chrono::Utc::now();
         let now_local = chrono::Local::now();

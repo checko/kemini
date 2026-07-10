@@ -23,6 +23,7 @@ sha2 = "0.10"
 hex = "0.4"
 regex = "1"
 base64 = "0.22"
+croner = "3.0.1"
 
 [profile.release]
 lto = true
