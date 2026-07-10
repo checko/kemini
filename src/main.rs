@@ -1,4 +1,5 @@
 mod agent;
+mod compaction;
 mod config;
 mod cron;
 mod heartbeat;
@@ -101,6 +102,14 @@ enum Command {
     },
     /// Live console dashboard: cron jobs + subagent runs, refreshed every 2s.
     Watch,
+    /// Force-compact a session (summarize history into a compaction record).
+    Compact {
+        /// Session label (default: the shared main session).
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -163,6 +172,10 @@ pub struct Runtime {
     /// before exit so spawned work is not killed with the process; the
     /// daemon lets them run detached.
     pub spawned: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Sessions with a compaction in flight. Guards against the memory-flush
+    /// turn (a normal agent turn inside compact()) re-triggering
+    /// auto-compaction recursively.
+    pub compacting: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Runtime {
@@ -175,6 +188,7 @@ impl Runtime {
             loaded,
             agent_id: agent_id.to_string(),
             spawned: std::sync::Mutex::new(Vec::new()),
+            compacting: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -417,7 +431,11 @@ impl Runtime {
             max_turns: 24,
         };
         let client = providers::LlmClient::new();
-        run.run_turn(&client, content).await
+        let reply = run.run_turn(&client, content).await?;
+        drop(run);
+        // Auto-compaction check (uses the contextTokens the turn just saved).
+        compaction::maybe_compact(self, session_key, &self.model_chain(model_override)[0]).await;
+        Ok(reply)
     }
 }
 
@@ -693,6 +711,22 @@ async fn main() -> Result<()> {
                 for r in &runs {
                     println!("{}", subagents::format_run_line(r));
                 }
+            }
+        }
+        Command::Compact { session, model } => {
+            let key = match session {
+                Some(label) => format!("agent:{}:{}", rt.agent_id, label),
+                None => sessions::main_session_key(&rt.agent_id),
+            };
+            match compaction::compact(&rt, &key, model.as_deref()).await? {
+                Some(stats) => println!(
+                    "compacted {key}: {} messages ({} tokens) → {} char summary; compactionCount={}",
+                    stats.messages_summarized,
+                    stats.tokens_before,
+                    stats.summary_chars,
+                    stats.compaction_count
+                ),
+                None => println!("nothing to compact (fewer than 4 messages)"),
             }
         }
         Command::Watch => loop {

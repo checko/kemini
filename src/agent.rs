@@ -84,6 +84,7 @@ impl<'a> AgentRun<'a> {
         let tool_specs = self.tools.specs();
         let mut history = self.transcript.load_messages()?;
         let mut final_text = String::new();
+        let mut last_context_tokens: i64 = 0;
 
         'outer: for _ in 0..self.max_turns {
             let (completion, used_ref) = self.complete_with_fallback(client, &history, &tool_specs).await?;
@@ -99,6 +100,9 @@ impl<'a> AgentRun<'a> {
                 "timestamp": chrono::Utc::now().timestamp_millis(),
             });
             self.transcript.append_message(assistant_msg.clone())?;
+            last_context_tokens = completion.usage["totalTokens"]
+                .as_i64()
+                .unwrap_or(last_context_tokens);
             history.push(assistant_msg);
 
             let tool_calls: Vec<Value> = completion
@@ -139,9 +143,17 @@ impl<'a> AgentRun<'a> {
         }
 
         let done_ms = chrono::Utc::now().timestamp_millis();
+        // contextTokens = size of the last completion's context (npm parity);
+        // the compaction trigger reads it back from the store row.
         self.store.upsert(
             &self.session_key,
-            json!({"updatedAt": done_ms, "systemSent": true}),
+            json!({
+                "updatedAt": done_ms,
+                "systemSent": true,
+                "contextTokens": last_context_tokens,
+                "totalTokens": last_context_tokens,
+                "totalTokensFresh": true,
+            }),
         );
         self.store.save()?;
         Ok(final_text)

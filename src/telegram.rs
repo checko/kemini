@@ -198,6 +198,19 @@ pub async fn run(
                 format!("agent:{}:telegram:group:{}", rt.agent_id, chat_id)
             };
 
+            if text.trim() == "/compact" {
+                let reply = match crate::compaction::compact(&rt, &session_key, model_override).await {
+                    Ok(Some(s)) => format!(
+                        "🗜 Compacted: {} messages ({} tokens) → {} char summary.",
+                        s.messages_summarized, s.tokens_before, s.summary_chars
+                    ),
+                    Ok(None) => "Nothing to compact yet.".to_string(),
+                    Err(e) => format!("⚠️ compaction failed: {e:#}"),
+                };
+                let _ = send_message(&http, &base, chat_id, &reply).await;
+                continue;
+            }
+
             // Bare /new or /reset rolls the session and runs the npm-style
             // session-startup turn; `/new <text>` starts fresh with that text.
             let (fresh, body) = match text.trim() {

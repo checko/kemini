@@ -24,6 +24,7 @@ and validated against a live OpenClaw 2026.6.10 installation.
 | Cron | Jobs stored in npm's canonical `cron_jobs`/`cron_run_logs` tables in `state/openclaw.sqlite` (same `store_key`, full `job_json`); schedule kinds `at`/`every`/`cron` with npm next-run semantics; isolated or session-targeted `agentTurn`/`systemEvent` payloads; `announce` delivery to telegram; `cron` agent tool (status/list/add/remove/run) + CLI |
 | Heartbeat | npm defaults: on for the default agent, every 30m, `HEARTBEAT_OK` ack suppression (≤30 char leftover), skip when HEARTBEAT.md is effectively empty; delivery via `agents.defaults.heartbeat.to` (e.g. `telegram:<peer>`) |
 | Subagents | `sessions_spawn` tool spawns isolated child sessions (`agent:<id>:subagent:<uuid>`), records runs in npm's `subagent_runs` table, announces completion back to the requester's telegram chat; `subagents` tool + CLI list |
+| Compaction | Auto-triggers at 80% of the model's context window (npm-format `compaction` transcript record: summary + `firstKeptEntryId` + `tokensBefore`); npm-parity memory-flush turn saves durable facts to memory files first; `compactionCount`/`contextTokens` tracked in sessions.json; force with `openclaw-rs compact` or `/compact` in chat; `OPENCLAW_RS_COMPACT_MAX_CONTEXT` overrides the cap for testing |
 | Tools | `exec` (shell in workspace, `tools.exec.security: full` semantics), `read`, `write`, `memory_search`, `memory_get`, `web_search`, `web_fetch`, `session_status` (live clock + session/model info, like npm's status card) |
 | Web search | Brave Search API (key from `plugins.entries.brave.config.webSearch.apiKey`, same as the npm brave plugin) with a self-contained SearXNG fallback — point `plugins.entries.searxng.config.url` or `OPENCLAW_SEARXNG_URL` at any instance with `format=json` enabled; `web_fetch` reduces pages to readable text |
 | Images | Inbound Telegram photos are saved to `<workspace>/media/inbound/` and forwarded as npm-format image parts (`{type:"image", data, mimeType}`) to vision models on all three provider dialects; CLI: `agent --image <file>`; vision turns route to `--image-model` / `agents.defaults.imageModel.primary` |
@@ -123,8 +124,8 @@ core runtime loop and the full on-disk contract; it does not yet implement:
 
 - the Gateway WebSocket server / Control UI / webchat (protocol documented in
   `docs/COMPAT.md`; the CLI here runs embedded turns instead)
-- plugins, hooks, compaction, commitments, dreaming, browser/canvas/nodes
-  tools; cron `command`/`on-exit` payloads and webhook delivery
+- plugins, hooks, commitments, dreaming, browser/canvas/nodes tools;
+  cron `command`/`on-exit` payloads and webhook delivery
 - image generation (image input works; generation does not), audio/voice
 - provider streaming (requests are non-streaming; npm always streams),
   embedding-based hybrid memory search (keyword/FTS parity only),

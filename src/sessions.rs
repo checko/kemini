@@ -194,19 +194,92 @@ impl Transcript {
 
     /// Load prior conversation messages (user/assistant/toolResult) for resume.
     pub fn load_messages(&self) -> Result<Vec<Value>> {
-        let Ok(text) = std::fs::read_to_string(&self.path) else { return Ok(vec![]) };
-        let mut out = Vec::new();
+        Ok(self.load_context()?.messages)
+    }
+
+    /// Load the model-facing context, honoring `compaction` records: the
+    /// latest compaction's summary replaces everything up to its
+    /// `firstKeptEntryId` (null = nothing kept). Messages after the
+    /// compaction record are always included.
+    pub fn load_context(&self) -> Result<LoadedContext> {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Ok(LoadedContext::default());
+        };
+        // (entry_id, message) pairs in transcript order
+        let mut pairs: Vec<(Option<String>, Value)> = Vec::new();
+        let mut summary: Option<String> = None;
+        let mut compaction_count = 0usize;
         for line in text.lines() {
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                if v.get("type").and_then(Value::as_str) == Some("message") {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            match v.get("type").and_then(Value::as_str) {
+                Some("message") => {
                     if let Some(m) = v.get("message") {
-                        out.push(m.clone());
+                        pairs.push((
+                            v.get("id").and_then(Value::as_str).map(String::from),
+                            m.clone(),
+                        ));
                     }
                 }
+                Some("compaction") => {
+                    compaction_count += 1;
+                    summary = v.get("summary").and_then(Value::as_str).map(String::from);
+                    let first_kept = v.get("firstKeptEntryId").and_then(Value::as_str);
+                    pairs = match first_kept {
+                        Some(keep_id) => {
+                            let idx = pairs
+                                .iter()
+                                .position(|(id, _)| id.as_deref() == Some(keep_id));
+                            match idx {
+                                Some(i) => pairs.split_off(i),
+                                None => Vec::new(),
+                            }
+                        }
+                        None => Vec::new(),
+                    };
+                }
+                _ => {}
             }
         }
-        Ok(out)
+        let mut messages = Vec::new();
+        if let Some(s) = &summary {
+            messages.push(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": format!(
+                    "[Conversation summary — earlier context was compacted]\n{s}"
+                )}],
+                "timestamp": 0,
+            }));
+        }
+        messages.extend(pairs.iter().map(|(_, m)| m.clone()));
+        Ok(LoadedContext { messages, summary, compaction_count })
     }
+
+    /// Write an npm-format compaction record.
+    pub fn append_compaction(
+        &mut self,
+        summary: &str,
+        first_kept_entry_id: Option<&str>,
+        tokens_before: i64,
+    ) -> Result<String> {
+        let mut body = Map::new();
+        body.insert("summary".into(), json!(summary));
+        body.insert(
+            "firstKeptEntryId".into(),
+            match first_kept_entry_id {
+                Some(id) => json!(id),
+                None => Value::Null,
+            },
+        );
+        body.insert("tokensBefore".into(), json!(tokens_before));
+        self.append_record("compaction", body)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LoadedContext {
+    pub messages: Vec<Value>,
+    pub summary: Option<String>,
+    pub compaction_count: usize,
 }
 
 /// Rename a transcript aside the way `/reset` does: `<file>.reset.<ISO-ts>`
@@ -284,5 +357,33 @@ mod tests {
             telegram_dm_session_key("main", 123456789),
             "agent:main:telegram:direct:123456789"
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+
+    #[test]
+    fn load_context_honors_compaction() {
+        let dir = std::env::temp_dir().join(format!("oc-rs-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut t = Transcript::create(&dir, "test-session", "/tmp").unwrap();
+        t.append_message(json!({"role":"user","content":[{"type":"text","text":"old fact: codeword BLUE"}]})).unwrap();
+        t.append_message(json!({"role":"assistant","content":[{"type":"text","text":"noted"}]})).unwrap();
+        t.append_compaction("Summary: user shared codeword BLUE.", None, 1234).unwrap();
+        t.append_message(json!({"role":"user","content":[{"type":"text","text":"newer message"}]})).unwrap();
+
+        let ctx = t.load_context().unwrap();
+        assert_eq!(ctx.compaction_count, 1);
+        assert_eq!(ctx.summary.as_deref(), Some("Summary: user shared codeword BLUE."));
+        // summary message + the one post-compaction message only
+        assert_eq!(ctx.messages.len(), 2);
+        let first = ctx.messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(first.contains("codeword BLUE"));
+        assert!(first.contains("[Conversation summary"));
+        let second = ctx.messages[1]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(second, "newer message");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
