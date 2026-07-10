@@ -7,6 +7,7 @@ mod providers;
 mod sessions;
 mod telegram;
 mod tools;
+mod websearch;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -45,6 +46,9 @@ enum Command {
         /// Ad-hoc session label (default: the shared main session).
         #[arg(long)]
         session: Option<String>,
+        /// Attach an image file to the message (needs a vision model).
+        #[arg(long)]
+        image: Option<String>,
     },
     /// Interactive chat in the terminal.
     Chat {
@@ -68,6 +72,9 @@ enum Command {
         /// Override model as provider/model-id for all telegram replies.
         #[arg(long)]
         model: Option<String>,
+        /// Model to use for turns that contain a photo (vision model).
+        #[arg(long)]
+        image_model: Option<String>,
     },
 }
 
@@ -146,9 +153,11 @@ impl Runtime {
     fn tool_runtime(&self) -> Result<tools::ToolRuntime> {
         let ws = self.workspace();
         let mem = memory::MemoryIndex::open(&self.paths.memory_index(&self.agent_id), &ws)?;
+        let search_cfg = websearch::SearchConfig::from_config(&self.loaded.raw);
         Ok(tools::ToolRuntime {
             workspace: ws,
             memory: std::sync::Mutex::new(mem),
+            web: websearch::WebTools::new(search_cfg),
         })
     }
 
@@ -246,6 +255,20 @@ impl Runtime {
         force_new: bool,
         model_override: Option<&str>,
     ) -> Result<String> {
+        self.run_message_parts(session_key, text, vec![], force_new, model_override)
+            .await
+    }
+
+    /// Full variant: text plus npm-format image parts
+    /// (`{type:"image", data:<base64>, mimeType}`).
+    pub async fn run_message_parts(
+        &self,
+        session_key: &str,
+        text: &str,
+        image_parts: Vec<serde_json::Value>,
+        force_new: bool,
+        model_override: Option<&str>,
+    ) -> Result<String> {
         let chain = self.model_chain(model_override);
         anyhow::ensure!(
             !chain.is_empty(),
@@ -276,6 +299,8 @@ impl Runtime {
         } else {
             text.to_string()
         };
+        let mut content = vec![serde_json::json!({"type":"text","text": text_with_context})];
+        content.extend(image_parts);
 
         let mut run = agent::AgentRun {
             config: &self.loaded.config,
@@ -289,8 +314,30 @@ impl Runtime {
             max_turns: 24,
         };
         let client = providers::LlmClient::new();
-        run.run_turn(&client, &text_with_context).await
+        run.run_turn(&client, content).await
     }
+}
+
+/// Read an image file into an npm-format transcript image part.
+fn image_part_from_file(path: &str) -> Result<serde_json::Value> {
+    use base64::Engine;
+    let bytes = std::fs::read(path).with_context(|| format!("reading image {path}"))?;
+    let mime = match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg",
+    };
+    Ok(serde_json::json!({
+        "type": "image",
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "mimeType": mime,
+    }))
 }
 
 #[tokio::main]
@@ -336,12 +383,19 @@ async fn main() -> Result<()> {
             new,
             model,
             session,
+            image,
         } => {
             let key = match session {
                 Some(label) => format!("agent:{}:{}", rt.agent_id, label),
                 None => sessions::main_session_key(&rt.agent_id),
             };
-            let reply = rt.run_message(&key, &message, new, model.as_deref()).await?;
+            let images = match image {
+                Some(p) => vec![image_part_from_file(&p)?],
+                None => vec![],
+            };
+            let reply = rt
+                .run_message_parts(&key, &message, images, new, model.as_deref())
+                .await?;
             println!("{reply}");
         }
         Command::Chat { new, model } => {
@@ -420,8 +474,16 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Telegram { model } => {
-            telegram::run(&rt, model.as_deref()).await?;
+        Command::Telegram { model, image_model } => {
+            // Fall back to the configured agents.defaults.imageModel.primary.
+            let cfg_image_model = rt
+                .loaded
+                .raw
+                .pointer("/agents/defaults/imageModel/primary")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let image_model = image_model.or(cfg_image_model);
+            telegram::run(&rt, model.as_deref(), image_model.as_deref()).await?;
         }
     }
     Ok(())

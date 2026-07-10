@@ -65,12 +65,13 @@ fn find_model<'p>(provider: &'p Provider, model_id: &str) -> Option<&'p ModelEnt
 }
 
 impl<'a> AgentRun<'a> {
-    /// Run one user turn to completion. Returns the final assistant text.
-    pub async fn run_turn(&mut self, client: &LlmClient, user_text: &str) -> Result<String> {
+    /// Run one user turn to completion. `user_content` is transcript-format
+    /// content parts (text and/or image). Returns the final assistant text.
+    pub async fn run_turn(&mut self, client: &LlmClient, user_content: Vec<Value>) -> Result<String> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let user_msg = json!({
             "role": "user",
-            "content": [{"type":"text","text": user_text}],
+            "content": user_content,
             "timestamp": now_ms,
         });
         self.transcript.append_message(user_msg)?;

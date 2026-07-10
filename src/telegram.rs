@@ -97,7 +97,11 @@ fn getrandom(buf: &mut [u8]) {
     }
 }
 
-pub async fn run(rt: &Runtime, model_override: Option<&str>) -> Result<()> {
+pub async fn run(
+    rt: &Runtime,
+    model_override: Option<&str>,
+    image_model: Option<&str>,
+) -> Result<()> {
     let Some(tg) = &rt.loaded.config.channels.telegram else {
         bail!("channels.telegram is not configured");
     };
@@ -139,7 +143,17 @@ pub async fn run(rt: &Runtime, model_override: Option<&str>) -> Result<()> {
         for update in updates["result"].as_array().unwrap_or(&vec![]) {
             offset = offset.max(update["update_id"].as_i64().unwrap_or(0) + 1);
             let Some(msg) = update.get("message") else { continue };
-            let Some(text) = msg["text"].as_str() else { continue };
+            // Text messages carry `text`; photos carry `photo` + optional `caption`.
+            let photo_file_id = msg["photo"]
+                .as_array()
+                .and_then(|sizes| sizes.last())
+                .and_then(|p| p["file_id"].as_str())
+                .map(String::from);
+            let text = match msg["text"].as_str() {
+                Some(t) => t,
+                None if photo_file_id.is_some() => msg["caption"].as_str().unwrap_or("Describe this image."),
+                None => continue,
+            };
             let chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
             let chat_type = msg["chat"]["type"].as_str().unwrap_or("private");
             let from_id = msg["from"]["id"].as_i64().unwrap_or(0);
@@ -201,7 +215,30 @@ pub async fn run(rt: &Runtime, model_override: Option<&str>) -> Result<()> {
             let typing = serde_json::json!({"chat_id": chat_id, "action": "typing"});
             let _ = api(&http, &base, "sendChatAction", typing).await;
 
-            match rt.run_message(&session_key, &body, fresh, model_override).await {
+            // Download attached photo into the workspace and build an image part.
+            let mut images = Vec::new();
+            let mut turn_model = model_override;
+            if let Some(file_id) = &photo_file_id {
+                match download_photo(&http, &base, token, file_id, &rt.workspace()).await {
+                    Ok(part) => {
+                        images.push(part);
+                        // Vision turns go to the image model when configured.
+                        if image_model.is_some() {
+                            turn_model = image_model;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("photo download failed: {e:#}");
+                        let _ = send_message(&http, &base, chat_id, "⚠️ could not download the photo").await;
+                        continue;
+                    }
+                }
+            }
+
+            match rt
+                .run_message_parts(&session_key, &body, images, fresh, turn_model)
+                .await
+            {
                 Ok(reply) if !reply.is_empty() => {
                     for chunk in split_message(&reply, 4000) {
                         if let Err(e) = send_message(&http, &base, chat_id, &chunk).await {
@@ -216,6 +253,47 @@ pub async fn run(rt: &Runtime, model_override: Option<&str>) -> Result<()> {
             }
         }
     }
+}
+
+/// Fetch a Telegram photo, store it under `<workspace>/media/inbound/`, and
+/// return an npm-format transcript image part.
+async fn download_photo(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    file_id: &str,
+    workspace: &std::path::Path,
+) -> Result<Value> {
+    use base64::Engine;
+    let info = api(http, base, "getFile", serde_json::json!({"file_id": file_id})).await?;
+    let Some(file_path) = info["result"]["file_path"].as_str() else {
+        bail!("getFile returned no file_path");
+    };
+    let url = format!("https://api.telegram.org/file/bot{token}/{file_path}");
+    let bytes = http.get(&url).send().await?.error_for_status()?.bytes().await?;
+
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg")
+        .to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "image/jpeg",
+    };
+    let dir = workspace.join("media").join("inbound");
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(format!("telegram-{}.{ext}", uuid::Uuid::new_v4()));
+    std::fs::write(&dest, &bytes)?;
+    tracing::info!("photo saved to {}", dest.display());
+
+    Ok(serde_json::json!({
+        "type": "image",
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "mimeType": mime,
+    }))
 }
 
 async fn api(http: &reqwest::Client, base: &str, method: &str, body: Value) -> Result<Value> {

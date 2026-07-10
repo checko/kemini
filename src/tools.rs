@@ -6,6 +6,7 @@
 
 use crate::memory::MemoryIndex;
 use crate::providers::ToolSpec;
+use crate::websearch::WebTools;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use tokio::process::Command;
 pub struct ToolRuntime {
     pub workspace: PathBuf,
     pub memory: std::sync::Mutex<MemoryIndex>,
+    pub web: WebTools,
 }
 
 impl ToolRuntime {
@@ -69,6 +71,30 @@ impl ToolRuntime {
                 }),
             },
             ToolSpec {
+                name: "web_search".into(),
+                description: "Search the web. Returns titles, URLs and snippets.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "count": {"type": "number", "description": "max results (default 5)"}
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolSpec {
+                name: "web_fetch".into(),
+                description: "Fetch a URL and return its readable text content.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "maxChars": {"type": "number", "description": "max characters returned (default 20000)"}
+                    },
+                    "required": ["url"]
+                }),
+            },
+            ToolSpec {
                 name: "memory_get".into(),
                 description: "Read a memory file (e.g. MEMORY.md or memory/2026-07-10.md), optionally a line range.".into(),
                 parameters: json!({
@@ -91,6 +117,8 @@ impl ToolRuntime {
             "write" => self.write(args),
             "memory_search" => self.memory_search(args),
             "memory_get" => self.memory_get(args),
+            "web_search" => self.web_search(args).await,
+            "web_fetch" => self.web_fetch(args).await,
             other => Ok((json!({"error": format!("unknown tool: {other}")}), true)),
         }
     }
@@ -238,6 +266,41 @@ impl ToolRuntime {
                 Ok((out, false))
             }
             Err(e) => Ok((json!({"path": p, "text": "", "error": e.to_string()}), true)),
+        }
+    }
+}
+
+impl ToolRuntime {
+    async fn web_search(&self, args: &Value) -> Result<(Value, bool)> {
+        let Some(q) = args.get("query").and_then(Value::as_str) else {
+            return Ok((json!({"error":"missing query"}), true));
+        };
+        let count = args.get("count").and_then(Value::as_u64).unwrap_or(5) as usize;
+        match self.web.search(q, count.clamp(1, 10)).await {
+            Ok((results, provider)) => Ok((
+                json!({
+                    "provider": provider,
+                    "results": results.iter().map(|r| json!({
+                        "title": r.title, "url": r.url, "snippet": r.snippet,
+                    })).collect::<Vec<_>>(),
+                }),
+                false,
+            )),
+            Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
+        }
+    }
+
+    async fn web_fetch(&self, args: &Value) -> Result<(Value, bool)> {
+        let Some(url) = args.get("url").and_then(Value::as_str) else {
+            return Ok((json!({"error":"missing url"}), true));
+        };
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Ok((json!({"error":"only http(s) URLs are supported"}), true));
+        }
+        let max = args.get("maxChars").and_then(Value::as_u64).unwrap_or(20_000) as usize;
+        match self.web.fetch(url, max.clamp(500, 100_000)).await {
+            Ok(v) => Ok((v, false)),
+            Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
         }
     }
 }

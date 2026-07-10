@@ -76,10 +76,22 @@ impl LlmClient {
         let mut wire: Vec<Value> = vec![json!({"role":"system","content":system})];
         for m in messages {
             match m.get("role").and_then(Value::as_str) {
-                Some("user") => wire.push(json!({
-                    "role":"user",
-                    "content": flatten_text(m),
-                })),
+                Some("user") => {
+                    let images = image_parts(m);
+                    if images.is_empty() {
+                        wire.push(json!({"role":"user","content": flatten_text(m)}));
+                    } else {
+                        // Multimodal: content array with text + data-URI images.
+                        let mut parts = vec![json!({"type":"text","text": flatten_text(m)})];
+                        for (mime, data) in images {
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{mime};base64,{data}")},
+                            }));
+                        }
+                        wire.push(json!({"role":"user","content": parts}));
+                    }
+                }
                 Some("assistant") => {
                     let mut msg = Map::new();
                     msg.insert("role".into(), json!("assistant"));
@@ -130,6 +142,11 @@ impl LlmClient {
         }
 
         let url = format!("{}/chat/completions", t.base_url.trim_end_matches('/'));
+        tracing::debug!(
+            "request to {url}: {} messages, multimodal={}",
+            wire.len(),
+            wire.iter().any(|m| m["content"].is_array())
+        );
         let mut req = self.http.post(&url).json(&body);
         if let Some(k) = &t.api_key {
             req = req.bearer_auth(k);
@@ -188,10 +205,16 @@ impl LlmClient {
         let mut input: Vec<Value> = Vec::new();
         for m in messages {
             match m.get("role").and_then(Value::as_str) {
-                Some("user") => input.push(json!({
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": flatten_text(m)}],
-                })),
+                Some("user") => {
+                    let mut parts = vec![json!({"type": "input_text", "text": flatten_text(m)})];
+                    for (mime, data) in image_parts(m) {
+                        parts.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{mime};base64,{data}"),
+                        }));
+                    }
+                    input.push(json!({"role": "user", "content": parts}));
+                }
                 Some("assistant") => {
                     let text = flatten_text(m);
                     if !text.is_empty() {
@@ -301,10 +324,16 @@ impl LlmClient {
         let mut wire: Vec<Value> = Vec::new();
         for m in messages {
             match m.get("role").and_then(Value::as_str) {
-                Some("user") => wire.push(json!({
-                    "role": "user",
-                    "content": [{"type":"text","text": flatten_text(m)}],
-                })),
+                Some("user") => {
+                    let mut parts = vec![json!({"type":"text","text": flatten_text(m)})];
+                    for (mime, data) in image_parts(m) {
+                        parts.push(json!({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": data},
+                        }));
+                    }
+                    wire.push(json!({"role": "user", "content": parts}));
+                }
                 Some("assistant") => {
                     let mut parts = Vec::new();
                     for c in content_parts(m) {
@@ -432,6 +461,23 @@ fn flatten_text(m: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// Extract npm-format image parts `{type:"image", data:<base64>, mimeType}`
+/// from a message. Returns (mimeType, base64Data) pairs.
+fn image_parts(m: &Value) -> Vec<(String, String)> {
+    content_parts(m)
+        .iter()
+        .filter(|c| c.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|c| {
+            let data = c.get("data").and_then(Value::as_str)?;
+            let mime = c
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("image/jpeg");
+            Some((mime.to_string(), data.to_string()))
+        })
+        .collect()
 }
 
 fn tool_result_text(m: &Value) -> String {

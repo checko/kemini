@@ -20,8 +20,10 @@ and validated against a live OpenClaw 2026.6.10 installation.
 | Sessions | `sessions.json` rows merged losslessly (unknown fields preserved), transcript JSONL v3 headers, `message`/`model_change`/`thinking_level_change` records, id/parentId chain, usage `{input,output,cacheRead,cacheWrite,totalTokens}`, stopReason normalization, daily-4AM/idle freshness, `/new`+`/reset` archive naming (`<uuid>.jsonl.reset.<ISO-ts>`) |
 | Session keys | `agent:<id>:main`, `agent:<id>:telegram:direct:<peer>`, group variants |
 | Startup context | Recent daily memory (`memory/YYYY-MM-DD*.md`, today+yesterday) prepended one-shot on fresh sessions |
-| Tools | `exec` (shell in workspace, `tools.exec.security: full` semantics), `read`, `write`, `memory_search`, `memory_get` |
-| Telegram | Long-polling getUpdates channel; `dmPolicy: pairing` enforced against `credentials/telegram-default-allowFrom.json`; pairing codes appended to `credentials/telegram-pairing.json` (npm store shape); groups require @-mention; 4k message chunking |
+| Tools | `exec` (shell in workspace, `tools.exec.security: full` semantics), `read`, `write`, `memory_search`, `memory_get`, `web_search`, `web_fetch` |
+| Web search | Brave Search API (key from `plugins.entries.brave.config.webSearch.apiKey`, same as the npm brave plugin) with a self-contained SearXNG fallback — point `plugins.entries.searxng.config.url` or `OPENCLAW_SEARXNG_URL` at any instance with `format=json` enabled; `web_fetch` reduces pages to readable text |
+| Images | Inbound Telegram photos are saved to `<workspace>/media/inbound/` and forwarded as npm-format image parts (`{type:"image", data, mimeType}`) to vision models on all three provider dialects; CLI: `agent --image <file>`; vision turns route to `--image-model` / `agents.defaults.imageModel.primary` |
+| Telegram | Long-polling getUpdates channel; `dmPolicy: pairing` enforced against `credentials/telegram-default-allowFrom.json`; pairing codes appended to `credentials/telegram-pairing.json` (npm store shape); groups require @-mention; 4k message chunking; photo messages supported |
 
 ## Usage
 
@@ -68,7 +70,19 @@ For fully-local testing the repo was validated with **Ornith 1.0 9B**
 
 ```bash
 ollama pull sparksammy/ornith-1.0-9b   # official `ornith:9b` needs Ollama > 0.20
-openclaw-rs agent --model ollama-localhost/sparksammy/ornith-1.0-9b -m "hi"
+openclaw-rs agent --model ollama-localhost/ornith-1.0-9b-q4 -m "hi"
+```
+
+> **Important:** rebuild pulled models with `PARAMETER num_ctx 24576` (see
+> `docs/COMPAT.md`) — Ollama's default 4096 context silently truncates the
+> OpenClaw bootstrap prompt and breaks tool calling and image input.
+
+Run the Telegram bot fully locally (text on Ornith, photos on a local
+vision model such as Gemma 4 E2B):
+
+```bash
+openclaw-rs telegram --model ollama-localhost/ornith-1.0-9b-q4 \
+                     --image-model ollama-localhost/gemma4-e2b-24k
 ```
 
 > **Warning:** do not run `openclaw-rs telegram` while the npm gateway is also
@@ -83,7 +97,8 @@ core runtime loop and the full on-disk contract; it does not yet implement:
 - the Gateway WebSocket server / Control UI / webchat (protocol documented in
   `docs/COMPAT.md`; the CLI here runs embedded turns instead)
 - skills, plugins, hooks, cron, subagents, sessions_spawn, compaction,
-  heartbeats, commitments, dreaming, browser/canvas/nodes/media tools
+  heartbeats, commitments, dreaming, browser/canvas/nodes tools
+- image generation (image input works; generation does not), audio/voice
 - provider streaming (requests are non-streaming; npm always streams),
   embedding-based hybrid memory search (keyword/FTS parity only),
   `openai-codex-responses` dialect and OAuth auth profiles
