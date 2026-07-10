@@ -64,7 +64,11 @@ enum Command {
         cmd: MemoryCmd,
     },
     /// Run the Telegram channel (long-polling).
-    Telegram,
+    Telegram {
+        /// Override model as provider/model-id for all telegram replies.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -416,8 +420,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Telegram => {
-            telegram::run(&rt).await?;
+        Command::Telegram { model } => {
+            telegram::run(&rt, model.as_deref()).await?;
         }
     }
     Ok(())

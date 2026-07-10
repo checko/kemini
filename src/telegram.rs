@@ -97,7 +97,7 @@ fn getrandom(buf: &mut [u8]) {
     }
 }
 
-pub async fn run(rt: &Runtime) -> Result<()> {
+pub async fn run(rt: &Runtime, model_override: Option<&str>) -> Result<()> {
     let Some(tg) = &rt.loaded.config.channels.telegram else {
         bail!("channels.telegram is not configured");
     };
@@ -201,7 +201,7 @@ pub async fn run(rt: &Runtime) -> Result<()> {
             let typing = serde_json::json!({"chat_id": chat_id, "action": "typing"});
             let _ = api(&http, &base, "sendChatAction", typing).await;
 
-            match rt.run_message(&session_key, &body, fresh, None).await {
+            match rt.run_message(&session_key, &body, fresh, model_override).await {
                 Ok(reply) if !reply.is_empty() => {
                     for chunk in split_message(&reply, 4000) {
                         if let Err(e) = send_message(&http, &base, chat_id, &chunk).await {
