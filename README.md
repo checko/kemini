@@ -43,6 +43,34 @@ cargo build --release
 `OPENCLAW_STATE_DIR=/path/to/state` overrides the state dir (useful for testing
 against a copy before pointing it at the real one).
 
+### Local test model
+
+For fully-local testing the repo was validated with **Ornith 1.0 9B**
+(DeepReinforce's MIT-licensed agentic coding model, Q4 ≈ 6 GB, runs on an
+8 GB GPU) served by a local Ollama:
+
+```jsonc
+// openclaw.json → models.providers
+"ollama-localhost": {
+  "baseUrl": "http://localhost:11434/v1",
+  "api": "openai-completions",
+  "apiKey": "ollama-local",
+  "models": [{
+    "id": "sparksammy/ornith-1.0-9b",   // or ornith:9b on newer Ollama
+    "name": "Ornith 1.0 9B (local ollama)",
+    "reasoning": true, "input": ["text"],
+    "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
+    "contextWindow": 262144, "maxTokens": 8192
+  }],
+  "request": {"allowPrivateNetwork": true}
+}
+```
+
+```bash
+ollama pull sparksammy/ornith-1.0-9b   # official `ornith:9b` needs Ollama > 0.20
+openclaw-rs agent --model ollama-localhost/sparksammy/ornith-1.0-9b -m "hi"
+```
+
 > **Warning:** do not run `openclaw-rs telegram` while the npm gateway is also
 > polling the same bot token — Telegram allows only one getUpdates consumer and
 > the two would conflict (409).
