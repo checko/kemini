@@ -16,6 +16,18 @@ pub struct ToolRuntime {
     pub workspace: PathBuf,
     pub memory: std::sync::Mutex<MemoryIndex>,
     pub web: WebTools,
+    pub session: SessionInfo,
+}
+
+/// Context surfaced by the session_status tool (npm parity: the status card
+/// is the agent's source for the live clock, since the system prompt only
+/// carries the timezone to stay cache-stable).
+#[derive(Debug, Clone, Default)]
+pub struct SessionInfo {
+    pub agent_id: String,
+    pub session_key: String,
+    pub model_ref: String,
+    pub context_window: Option<u64>,
 }
 
 impl ToolRuntime {
@@ -71,6 +83,14 @@ impl ToolRuntime {
                 }),
             },
             ToolSpec {
+                name: "session_status".into(),
+                description: "Get the current date/time and session status (agent, session, model, workspace). Use this whenever you need the live clock.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            ToolSpec {
                 name: "web_search".into(),
                 description: "Search the web. Returns titles, URLs and snippets.".into(),
                 parameters: json!({
@@ -119,6 +139,7 @@ impl ToolRuntime {
             "memory_get" => self.memory_get(args),
             "web_search" => self.web_search(args).await,
             "web_fetch" => self.web_fetch(args).await,
+            "session_status" => Ok(self.session_status()),
             other => Ok((json!({"error": format!("unknown tool: {other}")}), true)),
         }
     }
@@ -271,6 +292,27 @@ impl ToolRuntime {
 }
 
 impl ToolRuntime {
+    fn session_status(&self) -> (Value, bool) {
+        let now_utc = chrono::Utc::now();
+        let now_local = chrono::Local::now();
+        (
+            json!({
+                "time": {
+                    "iso": now_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "local": now_local.format("%Y-%m-%d %H:%M:%S %Z (%A)").to_string(),
+                    "timezoneOffset": now_local.format("%:z").to_string(),
+                },
+                "agent": self.session.agent_id,
+                "sessionKey": self.session.session_key,
+                "model": self.session.model_ref,
+                "contextWindow": self.session.context_window,
+                "workspace": self.workspace.to_string_lossy(),
+                "runtime": "openclaw-rs",
+            }),
+            false,
+        )
+    }
+
     async fn web_search(&self, args: &Value) -> Result<(Value, bool)> {
         let Some(q) = args.get("query").and_then(Value::as_str) else {
             return Ok((json!({"error":"missing query"}), true));

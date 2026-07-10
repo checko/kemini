@@ -150,7 +150,7 @@ impl Runtime {
         chain
     }
 
-    fn tool_runtime(&self) -> Result<tools::ToolRuntime> {
+    fn tool_runtime(&self, session: tools::SessionInfo) -> Result<tools::ToolRuntime> {
         let ws = self.workspace();
         let mem = memory::MemoryIndex::open(&self.paths.memory_index(&self.agent_id), &ws)?;
         let search_cfg = websearch::SearchConfig::from_config(&self.loaded.raw);
@@ -158,7 +158,21 @@ impl Runtime {
             workspace: ws,
             memory: std::sync::Mutex::new(mem),
             web: websearch::WebTools::new(search_cfg),
+            session,
         })
+    }
+
+    fn context_window_of(&self, model_ref: &str) -> Option<u64> {
+        let (prov, model) = config::split_model_ref(model_ref)?;
+        self.loaded
+            .config
+            .models
+            .providers
+            .get(prov)?
+            .models
+            .iter()
+            .find(|m| m.id == model)?
+            .context_window
     }
 
     fn build_prompt(&self, model_ref: &str, tool_names: Vec<String>) -> String {
@@ -274,7 +288,12 @@ impl Runtime {
             !chain.is_empty(),
             "no model configured (agents.defaults.model.primary)"
         );
-        let tools_rt = self.tool_runtime()?;
+        let tools_rt = self.tool_runtime(tools::SessionInfo {
+            agent_id: self.agent_id.clone(),
+            session_key: session_key.to_string(),
+            model_ref: chain[0].clone(),
+            context_window: self.context_window_of(&chain[0]),
+        })?;
         let tool_names: Vec<String> = tools_rt.specs().iter().map(|t| t.name.clone()).collect();
         let system_prompt = self.build_prompt(&chain[0], tool_names);
         let (mut store, mut transcript, _sid, is_fresh) =
