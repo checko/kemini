@@ -84,9 +84,9 @@ impl LlmClient {
                     let mut msg = Map::new();
                     msg.insert("role".into(), json!("assistant"));
                     let text = flatten_text(m);
-                    if !text.is_empty() {
-                        msg.insert("content".into(), json!(text));
-                    }
+                    // Always send a string — some servers (ollama) reject
+                    // assistant messages whose content is absent/null.
+                    msg.insert("content".into(), json!(text));
                     let calls: Vec<Value> = content_parts(m)
                         .iter()
                         .filter(|c| c.get("type").and_then(Value::as_str) == Some("toolCall"))
@@ -143,7 +143,14 @@ impl LlmClient {
                 content.push(json!({"type":"text","text":text}));
             }
         }
-        if let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) {
+        // Ollama emits `reasoning`; other OpenAI-compatible servers use
+        // `reasoning_content` / `reasoning_text`.
+        if let Some(reasoning) = msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .or_else(|| msg.get("reasoning_text"))
+            .and_then(Value::as_str)
+        {
             if !reasoning.is_empty() {
                 content.insert(0, json!({"type":"thinking","thinking":reasoning}));
             }
@@ -403,6 +410,7 @@ async fn check(resp: reqwest::Response) -> Result<Value> {
     if !status.is_success() {
         bail!("provider HTTP {status}: {}", &text[..text.len().min(2000)]);
     }
+    tracing::debug!("provider response: {}", &text[..text.len().min(1500)]);
     serde_json::from_str(&text).context("provider returned non-JSON body")
 }
 

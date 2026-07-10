@@ -60,7 +60,8 @@ impl MemoryIndex {
       hash TEXT NOT NULL,
       model TEXT NOT NULL,
       text TEXT NOT NULL,
-      embedding TEXT NOT NULL
+      embedding TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
     CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
@@ -169,9 +170,9 @@ impl MemoryIndex {
                     format!("memory:{rel}:{start}:{end}:{chunk_hash}:fts-only").as_bytes(),
                 ));
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding)
-                     VALUES (?1,?2,'memory',?3,?4,?5,'fts-only',?6,'[]')",
-                    rusqlite::params![id, rel, start, end, chunk_hash, chunk],
+                    "INSERT OR REPLACE INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
+                     VALUES (?1,?2,'memory',?3,?4,?5,'fts-only',?6,'[]',?7)",
+                    rusqlite::params![id, rel, start, end, chunk_hash, chunk, mtime],
                 )?;
                 self.conn.execute(
                     "INSERT INTO chunks_fts (text, id, path, source, model, start_line, end_line)
@@ -243,15 +244,18 @@ impl MemoryIndex {
             } else {
                 1.0 / (1.0 + rank)
             };
+            // npm wrote line numbers into the FTS table as REAL (JS numbers);
+            // read as f64 so both REAL and INTEGER rows load.
             Ok(SearchHit {
                 path: r.get(0)?,
-                start_line: r.get(1)?,
-                end_line: r.get(2)?,
+                start_line: r.get::<_, f64>(1)? as i64,
+                end_line: r.get::<_, f64>(2)? as i64,
                 text: r.get(3)?,
                 score,
             })
         })?;
-        Ok(rows.flatten().collect())
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Read a memory file with npm-parity bounds: default 120 lines, 12000
