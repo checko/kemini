@@ -74,6 +74,17 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
          write durable facts to MEMORY.md and daily context to today's memory file.\n\n",
     );
 
+    if let Some(skills) = skills_prompt(Path::new(&opts.workspace)) {
+        out.push_str("## Skills\n");
+        out.push_str(
+            "Scan <available_skills>. If one clearly applies to the request, use the `read` tool \
+             to load its SKILL.md at the exact <location> and follow it. Re-read a skill when its \
+             <version> differs from what you loaded before.\n\n",
+        );
+        out.push_str(&skills);
+        out.push_str("\n\n");
+    }
+
     if let Some(tz) = &opts.user_timezone {
         out.push_str("## Current Date & Time\n");
         out.push_str(&format!("Time zone: {tz}. Use session_status or exec for the live clock.\n\n"));
@@ -107,6 +118,82 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
 
 fn workspace_is_new(ws: &Path) -> bool {
     !ws.join("openclaw-workspace-state.json").exists()
+}
+
+/// Compact `<available_skills>` list from `<workspace>/skills/**/SKILL.md`,
+/// npm-style: name + description from YAML frontmatter, absolute location,
+/// content-derived sha256 version marker. Returns None when no skills exist.
+pub fn skills_prompt(ws: &Path) -> Option<String> {
+    const MAX_SKILLS_PROMPT_CHARS: usize = 16_000;
+    let mut skill_files = Vec::new();
+    let mut stack = vec![ws.join("skills")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|n| n == "SKILL.md") {
+                skill_files.push(p);
+            }
+        }
+    }
+    if skill_files.is_empty() {
+        return None;
+    }
+    skill_files.sort();
+
+    let mut out = String::from("<available_skills>\n");
+    for path in skill_files {
+        let Ok(content) = std::fs::read_to_string(&path) else { continue };
+        let (name, description) = parse_skill_frontmatter(&content, &path);
+        use sha2::Digest;
+        let version = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+        let entry = format!(
+            "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n    <version>sha256:{}</version>\n  </skill>\n",
+            xml_escape(&name),
+            xml_escape(&description),
+            path.display(),
+            version,
+        );
+        if out.len() + entry.len() > MAX_SKILLS_PROMPT_CHARS {
+            break;
+        }
+        out.push_str(&entry);
+    }
+    out.push_str("</available_skills>");
+    Some(out)
+}
+
+/// Minimal YAML frontmatter reader: `name:` and `description:` between the
+/// leading `---` fence pair. Falls back to the parent directory name.
+fn parse_skill_frontmatter(content: &str, path: &Path) -> (String, String) {
+    let fallback_name = path
+        .parent()
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "skill".into());
+    let mut name = fallback_name;
+    let mut description = String::new();
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) == Some("---") {
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed == "---" {
+                break;
+            }
+            if let Some(v) = trimmed.strip_prefix("name:") {
+                name = v.trim().trim_matches('"').to_string();
+            } else if let Some(v) = trimmed.strip_prefix("description:") {
+                description = v.trim().trim_matches('"').to_string();
+            }
+        }
+    }
+    (name, description)
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 pub fn inject_bootstrap_files(
