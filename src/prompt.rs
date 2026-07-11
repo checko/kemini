@@ -53,9 +53,14 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
 
     out.push_str("## Execution Bias\n");
     out.push_str(
-        "Act on actionable requests in-turn and continue until done or blocked. \
-         Recover from weak tool results; check mutable state live rather than assuming; \
-         verify outcomes before finalizing.\n\n",
+        "Act on actionable requests IN THIS TURN — do the work, do not just describe a plan and stop. \
+         When a task needs several steps (read files, then edit, then verify), keep calling tools \
+         across turns until it is actually done or you are blocked; do not end your reply after one \
+         tool call with only a status update. To change an existing file use the `edit` tool with an \
+         exact string — never rewrite a whole file with `write` unless you are creating it or have its \
+         full current content, because `write` deletes everything you omit. When a tool returns an \
+         error, read it and correct your next call (fix the path, copy exact text) instead of giving up. \
+         Only stop and reply when the requested change is complete and verified.\n\n",
     );
 
     out.push_str("## Safety\n");

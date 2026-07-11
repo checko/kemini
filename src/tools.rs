@@ -63,7 +63,7 @@ impl ToolRuntime {
             },
             ToolSpec {
                 name: "write".into(),
-                description: "Write content to a file (creates parent directories).".into(),
+                description: "Write content to a file, REPLACING it entirely (creates parent dirs). To change part of an existing file, prefer `edit` — write destroys everything not in `content`.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -71,6 +71,20 @@ impl ToolRuntime {
                         "content": {"type": "string"}
                     },
                     "required": ["path", "content"]
+                }),
+            },
+            ToolSpec {
+                name: "edit".into(),
+                description: "Edit an existing file by replacing an exact string. `oldText` must appear EXACTLY once (include enough surrounding context to be unique). Use this for changes to existing files instead of rewriting the whole file with write.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "oldText": {"type": "string", "description": "exact text to find (must be unique in the file)"},
+                        "newText": {"type": "string", "description": "replacement text"},
+                        "replaceAll": {"type": "boolean", "description": "replace every occurrence (default false)"}
+                    },
+                    "required": ["path", "oldText", "newText"]
                 }),
             },
             ToolSpec {
@@ -213,6 +227,7 @@ impl ToolRuntime {
             "exec" => self.exec(args).await,
             "read" => self.read(args),
             "write" => self.write(args),
+            "edit" => self.edit(args),
             "memory_search" => self.memory_search(args),
             "memory_get" => self.memory_get(args),
             "web_search" => self.web_search(args).await,
@@ -404,6 +419,50 @@ impl ToolRuntime {
             let _ = self.memory.lock().unwrap().sync();
         }
         Ok((json!({"ok": true, "path": path.to_string_lossy()}), false))
+    }
+
+    fn edit(&self, args: &Value) -> Result<(Value, bool)> {
+        let (Some(p), Some(old), Some(new)) = (
+            args.get("path").and_then(Value::as_str),
+            args.get("oldText").and_then(Value::as_str),
+            args.get("newText").and_then(Value::as_str),
+        ) else {
+            return Ok((json!({"error":"edit requires path, oldText, newText"}), true));
+        };
+        let path = self.resolve(p);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => return Ok((json!({"error": format!("{e} (resolved: {})", path.display())}), true)),
+        };
+        let replace_all = args.get("replaceAll").and_then(Value::as_bool).unwrap_or(false);
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Ok((
+                json!({"error":"oldText not found in file; read it first and copy the exact text (whitespace matters)"}),
+                true,
+            ));
+        }
+        if count > 1 && !replace_all {
+            return Ok((
+                json!({"error": format!("oldText appears {count} times; add surrounding context to make it unique, or set replaceAll=true")}),
+                true,
+            ));
+        }
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        if let Err(e) = std::fs::write(&path, &updated) {
+            return Ok((json!({"error": e.to_string()}), true));
+        }
+        if p.contains("memory/") || p.ends_with("MEMORY.md") {
+            let _ = self.memory.lock().unwrap().sync();
+        }
+        Ok((
+            json!({"ok": true, "path": path.to_string_lossy(), "replacements": if replace_all { count } else { 1 }}),
+            false,
+        ))
     }
 
     fn memory_search(&self, args: &Value) -> Result<(Value, bool)> {
