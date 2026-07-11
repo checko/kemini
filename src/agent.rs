@@ -101,6 +101,12 @@ impl<'a> AgentRun<'a> {
             .collect();
         let mut tools_ran = 0usize;
         let mut nudges_used = 0usize;
+        // Verify-on-stop (Hermes priority 3): if the model edits code but tries
+        // to finish without running/testing it, force one more turn to verify —
+        // this is what stops "here's the code" replies that don't actually run.
+        let mut edited_code = false;
+        let mut verified_since_edit = false;
+        let mut verify_nudges = 0usize;
 
         'outer: for _ in 0..self.max_turns {
             let (completion, used_ref) = self.complete_with_fallback(client, &history, &tool_specs).await?;
@@ -158,6 +164,22 @@ impl<'a> AgentRun<'a> {
                     history.push(nudge);
                     continue 'outer;
                 }
+                // Verify-on-stop: code was edited but never run/tested this turn.
+                if edited_code && !verified_since_edit && verify_nudges < 1 {
+                    verify_nudges += 1;
+                    let nudge = json!({
+                        "role": "user",
+                        "content": [{"type":"text","text":
+                            "You changed code but have not run it. Before you finish, VERIFY it works: \
+                             use exec to run the file or its tests (e.g. `python -c 'import <module>'`, \
+                             `bash run_tests.sh`, or run the script) and read the real output. If it \
+                             errors, fix it and re-run. Only report success after a command confirms \
+                             the code actually runs."}],
+                        "timestamp": chrono::Utc::now().timestamp_millis(),
+                    });
+                    history.push(nudge);
+                    continue 'outer;
+                }
                 break 'outer;
             }
 
@@ -171,6 +193,21 @@ impl<'a> AgentRun<'a> {
                     Ok(r) => r,
                     Err(e) => (json!({"error": format!("{e:#}")}), true),
                 };
+                // Track code edits vs verification for verify-on-stop.
+                if !is_error {
+                    match name {
+                        "write" | "edit" => {
+                            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                            if is_code_file(path) {
+                                edited_code = true;
+                                verified_since_edit = false;
+                            }
+                        }
+                        // Running a command counts as verifying the edit.
+                        "exec" => verified_since_edit = true,
+                        _ => {}
+                    }
+                }
                 let result_msg = json!({
                     "role": "toolResult",
                     "toolCallId": call.get("id"),
@@ -310,6 +347,18 @@ fn looks_unfinished(text: &str) -> bool {
     (has_intent || has_continuation) && !explicitly_finished
 }
 
+/// Does this path look like runnable code (worth verifying after an edit)?
+/// Prose/config (.md, .txt, .json) is excluded so docs edits aren't nudged.
+fn is_code_file(path: &str) -> bool {
+    const CODE_EXT: &[&str] = &[
+        ".py", ".rs", ".js", ".ts", ".jsx", ".tsx", ".sh", ".bash", ".go",
+        ".c", ".cc", ".cpp", ".h", ".hpp", ".java", ".rb", ".php", ".lua",
+        ".pl", ".swift", ".kt", ".sql", ".mjs", ".cjs",
+    ];
+    let lower = path.to_lowercase();
+    CODE_EXT.iter().any(|e| lower.ends_with(e))
+}
+
 fn tool_result_render(details: &Value) -> String {
     if let Some(s) = details.get("stdout").and_then(Value::as_str) {
         let code = details.get("exitCode").and_then(Value::as_i64).unwrap_or(0);
@@ -344,6 +393,14 @@ mod tests {
             "✅ Step 1 done — added _is_md_file() helper. Now verifying by reading back before continuing with next steps:"
         ));
         assert!(looks_unfinished("步驟 1 完成，接著處理下一步"));
+    }
+
+    #[test]
+    fn code_file_detection() {
+        assert!(super::is_code_file("~/myfilebrowser/src/utils.py"));
+        assert!(super::is_code_file("run_tests.sh"));
+        assert!(!super::is_code_file("README.md"));
+        assert!(!super::is_code_file("notes.txt"));
     }
 
     #[test]

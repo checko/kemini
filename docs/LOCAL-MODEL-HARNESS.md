@@ -7,6 +7,13 @@ adds scaffolding to make them more reliable. This documents what that
 scaffolding does — each item exists because a real failure was observed with
 Ornith 9B in practice.
 
+The step-completion techniques (continuation nudge, verify-on-stop, and the
+tool-use-enforcement / finishing-the-job prompt blocks) are adapted from
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent),
+whose harness is tuned for small local models. Notably its default
+enforcement list includes the `qwen` family — the architecture Ornith is
+built on.
+
 ## Harness features
 
 ### 1. `edit` tool (surgical file changes)
@@ -24,33 +31,42 @@ tool-result to the model instead of aborting the whole turn. The model reads
 the error and fixes its next call. `src/agent.rs`.
 
 ### 3. Continuation nudge
-Weak models frequently read a file, say "now let me implement X", and STOP
-without doing it. When the model ends a turn after having used tools, and its
-final text reads like an unfinished plan (intent phrases like "let me",
-"I'll", "接下來" without done-markers like "done"/"完成"/"changed"), kemini
-injects one nudge — "do it NOW using the tools" — and continues the loop.
-Capped at `max_nudges` (default 2) per turn so it can never loop forever.
-The detector is conservative (`looks_unfinished`), so genuine past-tense
-answers are never nudged. `src/agent.rs`.
+Weak models frequently read a file, say "✅ Step 1 done, now verifying
+before continuing", and STOP with no tool call. When the model ends a turn
+and its text signals more work is coming — intent phrases ("let me", "I'll",
+"接下來") OR continuation markers ("step N", "next step", "before continuing",
+"verifying", "步驟", "下一步") — kemini injects a nudge to execute the next
+action and continues the loop. The continuation markers fire even when the
+reply also says "done" (that usually means a *sub*-step), and even when no
+tool ran that turn (the model claimed progress in prose). Only an explicit
+whole-task completion marker ("all tests pass", "任務完成") suppresses it.
+Capped at `max_nudges` (default 4). `src/agent.rs` (`looks_unfinished`).
 
-### 4. Periodic task reminder
+### 4. Verify-on-stop
+Addresses "the code it wrote doesn't run". If the model edits a **code file**
+(.py/.rs/.sh/… — prose/.md excluded) and then tries to finish without ever
+running `exec`, kemini injects one nudge forcing it to run/test the code and
+read the real output before claiming success. Capped at 1 per turn.
+`src/agent.rs` (`is_code_file`).
+
+### 5. Periodic task reminder
 After every 4th tool call in a long turn, the user's original request is
 appended to that tool result: `[reminder: the user's request was: "…"]`.
 Small models drift or bleed unrelated old context across many steps; this
 re-anchors them on the actual goal. `src/agent.rs`.
 
-### 5. Execution-bias prompt
+### 6. Execution-bias prompt
 The system prompt explicitly tells the model to act in-turn (not just
 describe a plan), to prefer `edit` over `write` for existing files, to keep
 calling tools until the task is done, and to correct tool errors rather than
 give up. `src/prompt.rs`.
 
-### 6. Output budget for thinking models
+### 7. Output budget for thinking models
 Reasoning models (official Ornith) can spend their whole output budget on
 `<think>` and never emit an answer. Set the model's `maxTokens` high enough
 (16384 for Ornith) in `openclaw.json` so visible text remains after thinking.
 
-### 7. Bounded tool output
+### 8. Bounded tool output
 `read`/`exec` results are truncated (60 KB / 40 KB) so one big file cannot
 swamp a small context window. `read` on a directory returns a listing;
 `~` and PDF handling avoid dead-end errors.
