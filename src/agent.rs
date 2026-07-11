@@ -19,6 +19,8 @@ pub struct AgentRun<'a> {
     pub system_prompt: String,
     pub model_chain: Vec<String>, // ["provider/model", ...] primary first
     pub max_turns: usize,
+    /// Max continuation nudges per turn (harness aid for weak local models).
+    pub max_nudges: usize,
 }
 
 pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
@@ -86,6 +88,20 @@ impl<'a> AgentRun<'a> {
         let mut final_text = String::new();
         let mut last_context_tokens: i64 = 0;
 
+        // Harness state for small local models (see the nudge/reminder logic
+        // below). `user_goal` is the plain text of this turn's request.
+        let user_goal: String = user_content
+            .iter()
+            .filter(|c| c.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|c| c.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(400)
+            .collect();
+        let mut tools_ran = 0usize;
+        let mut nudges_used = 0usize;
+
         'outer: for _ in 0..self.max_turns {
             let (completion, used_ref) = self.complete_with_fallback(client, &history, &tool_specs).await?;
 
@@ -121,6 +137,26 @@ impl<'a> AgentRun<'a> {
             }
 
             if tool_calls.is_empty() {
+                // Continuation nudge: weak models often read a file, announce
+                // "now let me implement X", and stop WITHOUT doing it. If the
+                // model already used tools this turn and its final text reads
+                // like an unfinished plan, prod it once to actually execute.
+                if tools_ran > 0
+                    && nudges_used < self.max_nudges
+                    && looks_unfinished(&final_text)
+                {
+                    nudges_used += 1;
+                    let nudge = json!({
+                        "role": "user",
+                        "content": [{"type":"text","text":
+                            "You described what you will do but did not do it. Perform the change NOW \
+                             using the edit/write/exec tools, then report what you actually changed. \
+                             Do not just restate the plan."}],
+                        "timestamp": chrono::Utc::now().timestamp_millis(),
+                    });
+                    history.push(nudge);
+                    continue 'outer;
+                }
                 break 'outer;
             }
 
@@ -143,6 +179,18 @@ impl<'a> AgentRun<'a> {
                     "isError": is_error,
                     "timestamp": chrono::Utc::now().timestamp_millis(),
                 });
+                // Periodic task reminder: after several tool calls a small
+                // model drifts or bleeds unrelated context into its reply.
+                // Re-state the goal on the result so it stays anchored.
+                tools_ran += 1;
+                let mut result_msg = result_msg;
+                if tools_ran % 4 == 0 {
+                    if let Some(arr) = result_msg["content"].as_array_mut() {
+                        arr.push(json!({"type":"text","text":
+                            format!("[reminder: the user's request was: \"{user_goal}\". \
+                                     Keep working toward exactly that; finish it, then reply.)")}));
+                    }
+                }
                 self.transcript.append_message(result_msg.clone())?;
                 history.push(result_msg);
             }
@@ -226,6 +274,24 @@ fn resolve_api(config: &Config, model_ref: &str) -> String {
         .unwrap_or_else(|_| "openai-completions".into())
 }
 
+/// Heuristic: does this final reply describe an intended action rather than
+/// report a completed one? Used to decide whether to nudge a stalled model.
+/// Conservative — only fires on explicit intent phrases, so genuine answers
+/// (which report results in past tense) are left alone.
+fn looks_unfinished(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const INTENT: &[&str] = &[
+        "let me", "i'll ", "i will ", "i'm going to", "next, i", "now i'll",
+        "let's ", "going to implement", "let me implement", "i plan to",
+        "接下來", "讓我", "我將", "我會", "現在來", "準備", "打算",
+    ];
+    // "done"/"completed" style words suggest it actually finished.
+    const DONE: &[&str] = &["done", "完成", "已", "changed", "updated", "created", "fixed", "wrote"];
+    let has_intent = INTENT.iter().any(|p| t.contains(p));
+    let has_done = DONE.iter().any(|p| t.contains(p));
+    has_intent && !has_done
+}
+
 fn tool_result_render(details: &Value) -> String {
     if let Some(s) = details.get("stdout").and_then(Value::as_str) {
         let code = details.get("exitCode").and_then(Value::as_i64).unwrap_or(0);
@@ -240,4 +306,25 @@ fn tool_result_render(details: &Value) -> String {
         return s.to_string();
     }
     serde_json::to_string_pretty(details).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_unfinished;
+
+    #[test]
+    fn detects_unfinished_plans() {
+        assert!(looks_unfinished("Now let me implement the render function."));
+        assert!(looks_unfinished("接下來我會修改 viewer 程式碼"));
+        assert!(looks_unfinished("I'll add the markdown parser next."));
+    }
+
+    #[test]
+    fn accepts_completed_replies() {
+        // Past-tense / done markers mean it finished — no nudge.
+        assert!(!looks_unfinished("Done — I updated utils.py with render_markdown."));
+        assert!(!looks_unfinished("已完成，已修改 viewer。"));
+        assert!(!looks_unfinished("The kernel is 6.17.0-35-generic."));
+        assert!(!looks_unfinished("I changed the viewer; let me know if you want more."));
+    }
 }

@@ -26,7 +26,7 @@ and validated against a live OpenClaw 2026.6.10 installation.
 | Subagents | `sessions_spawn` tool spawns isolated child sessions (`agent:<id>:subagent:<uuid>`), records runs in npm's `subagent_runs` table, announces completion back to the requester's telegram chat; `subagents` tool + CLI list |
 | Browser (read-only) | Headless system Chrome via CLI (no CDP dependency): `browser_open` returns JS-rendered page text, `browser_screenshot` saves a PNG, `browser_look` screenshots + asks the vision model about the page in one call; persistent cookie profile under `<state>/browser-profile` |
 | Compaction | Auto-triggers at 80% of the model's context window (npm-format `compaction` transcript record: summary + `firstKeptEntryId` + `tokensBefore`); npm-parity memory-flush turn saves durable facts to memory files first; `compactionCount`/`contextTokens` tracked in sessions.json; force with `kemini compact` or `/compact` in chat; `KEMINI_COMPACT_MAX_CONTEXT` overrides the cap for testing |
-| Tools | `exec` (shell in workspace, `tools.exec.security: full` semantics), `read`, `write`, `memory_search`, `memory_get`, `web_search`, `web_fetch`, `session_status` (live clock + session/model info, like npm's status card) |
+| Tools | `exec` (shell in workspace, `tools.exec.security: full` semantics), `read`, `write`, `edit` (surgical string replace), `memory_search`, `memory_get`, `web_search`, `web_fetch`, `session_status` (live clock + session/model info, like npm's status card) |
 | Web search | Brave Search API (key from `plugins.entries.brave.config.webSearch.apiKey`, same as the npm brave plugin) with a self-contained SearXNG fallback — point `plugins.entries.searxng.config.url` or `OPENCLAW_SEARXNG_URL` at any instance with `format=json` enabled; `web_fetch` reduces pages to readable text |
 | Images | Inbound Telegram photos are saved to `<workspace>/media/inbound/` and forwarded as npm-format image parts (`{type:"image", data, mimeType}`) to vision models on all three provider dialects; CLI: `agent --image <file>`; vision turns route to `--image-model` / `agents.defaults.imageModel.primary` |
 | Telegram | Long-polling getUpdates channel; `dmPolicy: pairing` enforced against `credentials/telegram-default-allowFrom.json`; pairing codes appended to `credentials/telegram-pairing.json` (npm store shape); groups require @-mention; 4k message chunking; photo messages supported |
@@ -50,6 +50,15 @@ cargo build --release
 
 `OPENCLAW_STATE_DIR=/path/to/state` overrides the state dir (useful for testing
 against a copy before pointing it at the real one).
+
+### Running fully local (sensitive data)
+
+kemini can run entirely offline against a local Ollama model so sensitive
+data/code never leaves the machine. A dedicated harness makes small (~9B)
+local models more reliable at multi-step work — see
+**[docs/LOCAL-MODEL-HARNESS.md](docs/LOCAL-MODEL-HARNESS.md)** (edit tool,
+recoverable tool errors, continuation nudge, task reminders, execution-bias
+prompt, thinking-model output budget).
 
 ### Choosing models (local Ollama vs OpenRouter/remote)
 
