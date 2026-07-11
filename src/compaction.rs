@@ -64,13 +64,27 @@ pub async fn compact(
     session_key: &str,
     model_override: Option<&str>,
 ) -> Result<Option<CompactStats>> {
+    compact_opts(rt, session_key, model_override, false).await
+}
+
+/// `skip_flush`: bypass the memory-flush turn. Used when the context is
+/// critically full — a flush turn is itself a full-context model call and
+/// just returns empty (observed live: a session wedged at num_ctx where
+/// every turn, including the flush, died with stopReason=length and no
+/// text, so compaction could never complete).
+pub async fn compact_opts(
+    rt: &Arc<Runtime>,
+    session_key: &str,
+    model_override: Option<&str>,
+    skip_flush: bool,
+) -> Result<Option<CompactStats>> {
     // Re-entry guard: the memory-flush turn below is a normal agent turn and
     // would otherwise re-trigger maybe_compact recursively (observed as an
     // infinite flush loop in testing).
     if !rt.compacting.lock().unwrap().insert(session_key.to_string()) {
         anyhow::bail!("compaction already in flight for {session_key}");
     }
-    let result = compact_inner(rt, session_key, model_override).await;
+    let result = compact_inner(rt, session_key, model_override, skip_flush).await;
     rt.compacting.lock().unwrap().remove(session_key);
     result
 }
@@ -79,6 +93,7 @@ async fn compact_inner(
     rt: &Arc<Runtime>,
     session_key: &str,
     model_override: Option<&str>,
+    skip_flush: bool,
 ) -> Result<Option<CompactStats>> {
     let store_path = rt.paths.sessions_store(&rt.agent_id);
     let sessions_dir = rt.paths.sessions_dir(&rt.agent_id);
@@ -93,18 +108,22 @@ async fn compact_inner(
     let tokens_before = row["contextTokens"].as_i64().unwrap_or(0);
 
     // 1. memory-flush turn (has tools; recorded in the transcript like npm).
-    let flush_model = rt
-        .loaded
-        .raw
-        .pointer("/agents/defaults/compaction/memoryFlush/model")
-        .and_then(Value::as_str)
-        .map(String::from)
-        .or_else(|| model_override.map(String::from));
-    if let Err(e) = rt
-        .run_message_parts(session_key, MEMORY_FLUSH_PROMPT, vec![], false, flush_model.as_deref())
-        .await
-    {
-        tracing::warn!("memory-flush turn failed (continuing to compact): {e:#}");
+    if skip_flush {
+        tracing::info!("compaction: context critically full — skipping memory-flush turn");
+    } else {
+        let flush_model = rt
+            .loaded
+            .raw
+            .pointer("/agents/defaults/compaction/memoryFlush/model")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| model_override.map(String::from));
+        if let Err(e) = rt
+            .run_message_parts(session_key, MEMORY_FLUSH_PROMPT, vec![], false, flush_model.as_deref())
+            .await
+        {
+            tracing::warn!("memory-flush turn failed (continuing to compact): {e:#}");
+        }
     }
 
     // 2. summarize the full live context, tool-free.
@@ -117,7 +136,12 @@ async fn compact_inner(
     anyhow::ensure!(!chain.is_empty(), "no model configured");
     let target = crate::agent::resolve_target(&rt.loaded.config, &chain[0])?;
     let client = LlmClient::new();
-    let mut messages = ctx.messages.clone();
+    // Bound the summarizer's input: a wedged session (history ≈ num_ctx)
+    // would otherwise leave the summarizer no room to generate, so it
+    // returns empty and compaction fails forever. Keep any prior summary
+    // message plus the most recent messages within a ~60k char budget
+    // (≈15k tokens) — enough to summarize well, small enough to always run.
+    let mut messages = bound_for_summary(&ctx.messages, 60_000);
     messages.push(json!({
         "role": "user",
         "content": [{"type": "text", "text": SUMMARY_PROMPT}],
@@ -154,6 +178,50 @@ async fn compact_inner(
         messages_summarized: ctx.messages.len(),
         compaction_count: count,
     }))
+}
+
+/// Keep the leading summary message (if the session was compacted before)
+/// plus as many of the MOST RECENT messages as fit in `char_budget`
+/// (measured on serialized content). Middle history is dropped — the
+/// summary prompt asks for facts, and recency matters most.
+fn bound_for_summary(messages: &[Value], char_budget: usize) -> Vec<Value> {
+    let msg_len = |m: &Value| serde_json::to_string(&m["content"]).map(|s| s.len()).unwrap_or(0);
+    let total: usize = messages.iter().map(msg_len).sum();
+    if total <= char_budget {
+        return messages.to_vec();
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    // Always keep a leading prior-summary message when present.
+    let head = messages.first().filter(|m| {
+        m["content"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("[Conversation summary"))
+    });
+    if let Some(h) = head {
+        used += msg_len(h);
+    }
+    let start = if head.is_some() { 1 } else { 0 };
+    let mut tail: Vec<Value> = Vec::new();
+    for m in messages[start..].iter().rev() {
+        let l = msg_len(m);
+        if used + l > char_budget && !tail.is_empty() {
+            break;
+        }
+        used += l;
+        tail.push(m.clone());
+    }
+    tail.reverse();
+    if let Some(h) = head {
+        out.push(h.clone());
+        out.push(json!({
+            "role": "user",
+            "content": [{"type":"text","text":"[…older messages omitted for compaction…]"}],
+            "timestamp": 0,
+        }));
+    }
+    out.extend(tail);
+    out
 }
 
 /// Post-turn auto-trigger, called from run_message_parts.

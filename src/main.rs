@@ -386,6 +386,38 @@ impl Runtime {
             !chain.is_empty(),
             "no model configured (agents.defaults.model.primary)"
         );
+
+        // PRE-turn compaction: a session over the cap must be compacted
+        // BEFORE the model call — post-turn-only compaction wedged a live
+        // session (history ≈ num_ctx ⇒ every turn returns length/empty and
+        // the post-turn hook never gets a working turn to run after).
+        // Skipped while a compaction is already in flight (flush turn).
+        if !force_new && !self.compacting.lock().unwrap().contains(session_key) {
+            let cap = compaction::context_cap(self, &chain[0]);
+            let ctx0 = sessions::SessionStore::open(&self.paths.sessions_store(&self.agent_id))
+                .ok()
+                .and_then(|s| s.get(session_key)?.get("contextTokens")?.as_i64())
+                .unwrap_or(0);
+            if ctx0 > cap {
+                // Critically full (>90% of window): skip the flush turn too.
+                let skip_flush = ctx0 > cap + cap / 8;
+                tracing::info!(
+                    "pre-turn compaction for {session_key}: ctx {ctx0} > cap {cap} (skip_flush={skip_flush})"
+                );
+                // Box::pin: breaks async recursion (this fn → compact → flush turn → this fn)
+                if let Err(e) = Box::pin(compaction::compact_opts(
+                    self,
+                    session_key,
+                    Some(&chain[0]),
+                    skip_flush,
+                ))
+                .await
+                {
+                    tracing::warn!("pre-turn compaction failed: {e:#}");
+                }
+            }
+        }
+
         let mut tools_rt = self.tool_runtime(tools::SessionInfo {
             agent_id: self.agent_id.clone(),
             session_key: session_key.to_string(),
