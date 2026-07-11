@@ -1,5 +1,5 @@
 [package]
-name = "openclaw-rs"
+name = "kemini"
 version = "0.1.0"
 edition = "2021"
 description = "Rust reimplementation of the OpenClaw personal AI assistant core, compatible with the ~/.openclaw state directory"

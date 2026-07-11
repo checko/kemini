@@ -92,7 +92,7 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
 
     out.push_str("## Runtime\n");
     out.push_str(&format!(
-        "agent: {} | model: {} | openclaw-rs (Rust reimplementation)\n\n",
+        "agent: {} | model: {} | kemini (Rust reimplementation)\n\n",
         opts.agent_id, opts.model_ref
     ));
 

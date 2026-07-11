@@ -558,7 +558,7 @@ impl ToolRuntime {
                 "model": self.session.model_ref,
                 "contextWindow": self.session.context_window,
                 "workspace": self.workspace.to_string_lossy(),
-                "runtime": "openclaw-rs",
+                "runtime": "kemini",
             }),
             false,
         )

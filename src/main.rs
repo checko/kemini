@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "openclaw-rs",
+    name = "kemini",
     about = "Rust reimplementation of the OpenClaw core, compatible with ~/.openclaw",
     version
 )]
@@ -466,7 +466,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "openclaw_rs=info".into()),
+                .unwrap_or_else(|_| "kemini=info".into()),
         )
         .init();
     let cli = Cli::parse();
@@ -736,7 +736,7 @@ async fn main() -> Result<()> {
             let runs = sub_store.list(Some(24 * 60)).unwrap_or_default();
             print!("\x1B[2J\x1B[H"); // clear screen
             println!(
-                "openclaw-rs watch — {}  (Ctrl-C to exit)\n",
+                "kemini watch — {}  (Ctrl-C to exit)\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
             );
             println!("── cron jobs ({}) ──────────────────────────", jobs.len());

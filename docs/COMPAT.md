@@ -1,4 +1,4 @@
-# OpenClaw ↔ openclaw-rs on-disk compatibility contract
+# OpenClaw ↔ kemini on-disk compatibility contract
 
 Ground truth gathered from a live OpenClaw 2026.6.10 installation at
 `~/.openclaw` (npm package `openclaw`, dist 2026.6.10) and the bundled docs.

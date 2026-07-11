@@ -8,7 +8,7 @@
 //!
 //! Trigger: after each turn when the last completion's context tokens exceed
 //! 80% of the model's contextWindow (or `contextTokens` when smaller).
-//! `OPENCLAW_RS_COMPACT_MAX_CONTEXT=<tokens>` overrides the cap for testing.
+//! `KEMINI_COMPACT_MAX_CONTEXT=<tokens>` overrides the cap for testing.
 
 use crate::providers::LlmClient;
 use crate::Runtime;
@@ -36,7 +36,7 @@ pub struct CompactStats {
 
 /// Resolve the token cap that triggers compaction for a model.
 pub fn context_cap(rt: &Runtime, model_ref: &str) -> i64 {
-    if let Some(cap) = std::env::var("OPENCLAW_RS_COMPACT_MAX_CONTEXT")
+    if let Some(cap) = std::env::var("KEMINI_COMPACT_MAX_CONTEXT")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
     {

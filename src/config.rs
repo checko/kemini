@@ -290,11 +290,11 @@ mod tests {
 
     #[test]
     fn placeholders_expand_and_escape() {
-        std::env::set_var("OPENCLAW_RS_TEST_VAR", "sekrit");
-        assert_eq!(expand_placeholders("${OPENCLAW_RS_TEST_VAR}"), "sekrit");
-        assert_eq!(expand_placeholders("$${OPENCLAW_RS_TEST_VAR}"), "${OPENCLAW_RS_TEST_VAR}");
+        std::env::set_var("KEMINI_TEST_VAR", "sekrit");
+        assert_eq!(expand_placeholders("${KEMINI_TEST_VAR}"), "sekrit");
+        assert_eq!(expand_placeholders("$${KEMINI_TEST_VAR}"), "${KEMINI_TEST_VAR}");
         // Missing vars keep the placeholder; lowercase names never match.
-        assert_eq!(expand_placeholders("${OPENCLAW_RS_UNSET_VAR_XYZ}"), "${OPENCLAW_RS_UNSET_VAR_XYZ}");
+        assert_eq!(expand_placeholders("${KEMINI_UNSET_VAR_XYZ}"), "${KEMINI_UNSET_VAR_XYZ}");
         assert_eq!(expand_placeholders("${not_upper}"), "${not_upper}");
     }
 }

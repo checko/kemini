@@ -55,7 +55,7 @@ impl WebTools {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
-                .user_agent("openclaw-rs/0.1 (web tools)")
+                .user_agent("kemini/0.1 (web tools)")
                 .build()
                 .expect("http client"),
             config,

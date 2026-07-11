@@ -3,7 +3,7 @@
 //! Child sessions use the npm key shape `agent:<id>:subagent:<uuid>`;
 //! completion is announced back to the requester's channel when it is a
 //! telegram session, and always recorded as frozen_result_text for console
-//! inspection (`openclaw-rs subagents list`).
+//! inspection (`kemini subagents list`).
 
 use crate::Runtime;
 use anyhow::{Context, Result};
@@ -210,7 +210,7 @@ pub fn spawn(
         "runId": run_id,
         "childSessionKey": child_session_key,
         "status": "running",
-        "note": "completion will be announced to the requester channel; check `subagents` tool or `openclaw-rs subagents list`",
+        "note": "completion will be announced to the requester channel; check `subagents` tool or `kemini subagents list`",
     }))
 }
 
