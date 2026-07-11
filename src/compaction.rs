@@ -42,7 +42,7 @@ pub fn context_cap(rt: &Runtime, model_ref: &str) -> i64 {
     {
         return cap;
     }
-    let window = crate::config::split_model_ref(model_ref)
+    let (window, max_out) = crate::config::split_model_ref(model_ref)
         .and_then(|(prov, model)| {
             let p = rt.loaded.config.models.providers.get(prov)?;
             let m = p.models.iter().find(|m| m.id == model)?;
@@ -51,10 +51,18 @@ pub fn context_cap(rt: &Runtime, model_ref: &str) -> i64 {
                 .get("contextTokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(u64::MAX);
-            Some(m.context_window.unwrap_or(32_000).min(ctx))
+            let window = m.context_window.unwrap_or(32_000).min(ctx);
+            Some((window, m.max_tokens.unwrap_or(4096)))
         })
-        .unwrap_or(32_000);
-    (window as i64) * 8 / 10
+        .unwrap_or((32_000, 4096));
+    // Reserve the model's output budget: `contextWindow` (Ollama num_ctx) is
+    // the TOTAL window shared by prompt AND generation. Without reserving
+    // max_tokens, context grows until there is no room to generate and every
+    // call returns length/empty (the wedge). Compact on 80% of the USABLE
+    // input window (window − output). Floor at half the window so a model
+    // with a huge maxTokens still leaves reasonable input room.
+    let usable = window.saturating_sub(max_out).max(window / 2);
+    (usable as i64) * 8 / 10
 }
 
 /// Force-compact a session. Returns None when there is too little history
