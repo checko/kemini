@@ -153,8 +153,11 @@ impl WebTools {
             .unwrap_or_default())
     }
 
-    /// Fetch a URL and reduce it to readable text (bounded).
-    pub async fn fetch(&self, url: &str, max_chars: usize) -> Result<Value> {
+    /// Fetch a URL. Text/HTML is reduced to readable text (bounded). Binary
+    /// content (PDF or anything non-text) is saved under `save_dir` and PDFs
+    /// are additionally converted to text via pdftotext, so "post a file URL
+    /// → download → read" works in one tool call.
+    pub async fn fetch(&self, url: &str, max_chars: usize, save_dir: &std::path::Path) -> Result<Value> {
         let resp = self
             .http
             .get(url)
@@ -168,30 +171,83 @@ impl WebTools {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
-            .to_string();
-        let body = resp.text().await?;
-        let text = if content_type.contains("html") {
-            html_to_text(&body)
-        } else {
-            body
-        };
-        let mut text = text;
-        let truncated = text.len() > max_chars;
-        if truncated {
-            let mut end = max_chars;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
+            .to_lowercase();
+        let bytes = resp.bytes().await?;
+
+        let is_pdf = content_type.contains("pdf") || bytes.starts_with(b"%PDF");
+        let is_texty = !is_pdf
+            && (content_type.starts_with("text/")
+                || content_type.contains("json")
+                || content_type.contains("xml")
+                || content_type.contains("javascript")
+                || (content_type.is_empty() && std::str::from_utf8(&bytes).is_ok()));
+
+        if is_texty {
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            let mut text = if content_type.contains("html") {
+                html_to_text(&body)
+            } else {
+                body
+            };
+            let truncated = truncate_chars(&mut text, max_chars);
+            return Ok(json!({
+                "url": url, "status": status, "contentType": content_type,
+                "truncated": truncated, "text": text,
+            }));
+        }
+
+        // Binary: persist to disk so read/exec can work on it afterwards.
+        std::fs::create_dir_all(save_dir)?;
+        let name = url
+            .split('/')
+            .next_back()
+            .unwrap_or("download")
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("download")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            .collect::<String>();
+        let name = if name.is_empty() { "download".into() } else { name };
+        let dest = save_dir.join(format!("{}-{}", uuid::Uuid::new_v4().simple(), name));
+        std::fs::write(&dest, &bytes)?;
+
+        if is_pdf {
+            let out = std::process::Command::new("pdftotext")
+                .arg("-layout")
+                .arg(&dest)
+                .arg("-")
+                .output();
+            if let Ok(o) = out {
+                if o.status.success() {
+                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                    let truncated = truncate_chars(&mut text, max_chars);
+                    return Ok(json!({
+                        "url": url, "status": status, "contentType": content_type,
+                        "savedPath": dest.to_string_lossy(), "sourceFormat": "pdf",
+                        "truncated": truncated, "text": text,
+                    }));
+                }
             }
-            text.truncate(end);
         }
         Ok(json!({
-            "url": url,
-            "status": status,
-            "contentType": content_type,
-            "truncated": truncated,
-            "text": text,
+            "url": url, "status": status, "contentType": content_type,
+            "savedPath": dest.to_string_lossy(), "bytes": bytes.len(),
+            "note": "binary file saved; use read (PDFs) or exec to process it",
         }))
     }
+}
+
+fn truncate_chars(text: &mut String, max_chars: usize) -> bool {
+    if text.len() <= max_chars {
+        return false;
+    }
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
 }
 
 /// Small dependency-free HTML → text reduction: drop script/style, strip

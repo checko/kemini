@@ -591,7 +591,8 @@ impl ToolRuntime {
             return Ok((json!({"error":"only http(s) URLs are supported"}), true));
         }
         let max = args.get("maxChars").and_then(Value::as_u64).unwrap_or(20_000) as usize;
-        match self.web.fetch(url, max.clamp(500, 100_000)).await {
+        let save_dir = self.workspace.join("media").join("inbound");
+        match self.web.fetch(url, max.clamp(500, 100_000), &save_dir).await {
             Ok(v) => Ok((v, false)),
             Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
         }

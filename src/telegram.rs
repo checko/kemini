@@ -149,9 +149,20 @@ pub async fn run(
                 .and_then(|sizes| sizes.last())
                 .and_then(|p| p["file_id"].as_str())
                 .map(String::from);
+            // Document attachments (PDFs, text files, …): download and let
+            // the model read them from disk.
+            let document = msg["document"].as_object().map(|d| {
+                (
+                    d["file_id"].as_str().unwrap_or("").to_string(),
+                    d["file_name"].as_str().unwrap_or("file").to_string(),
+                )
+            });
             let text = match msg["text"].as_str() {
                 Some(t) => t,
                 None if photo_file_id.is_some() => msg["caption"].as_str().unwrap_or("Describe this image."),
+                None if document.is_some() => msg["caption"]
+                    .as_str()
+                    .unwrap_or("Read the attached file and summarize it."),
                 None => continue,
             };
             let chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
@@ -228,6 +239,22 @@ pub async fn run(
             let typing = serde_json::json!({"chat_id": chat_id, "action": "typing"});
             let _ = api(&http, &base, "sendChatAction", typing).await;
 
+            // Download attached document; tell the model where it landed so
+            // it can use read (PDF/text) or exec on it.
+            let mut body = body;
+            if let Some((file_id, file_name)) = &document {
+                match download_document(&http, &base, token, file_id, file_name, &rt.workspace()).await {
+                    Ok(path) => {
+                        body = format!("[Attached file saved at: {path}]\n{body}");
+                    }
+                    Err(e) => {
+                        tracing::warn!("document download failed: {e:#}");
+                        let _ = send_message(&http, &base, chat_id, "⚠️ could not download the attached file").await;
+                        continue;
+                    }
+                }
+            }
+
             // Download attached photo into the workspace and build an image part.
             let mut images = Vec::new();
             let mut turn_model = model_override;
@@ -266,6 +293,35 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Fetch a Telegram document attachment into `<workspace>/media/inbound/`,
+/// keeping (a sanitized form of) its original filename so extensions like
+/// .pdf keep working with the read tool. Returns the saved path.
+async fn download_document(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    file_id: &str,
+    file_name: &str,
+    workspace: &std::path::Path,
+) -> Result<String> {
+    let info = api(http, base, "getFile", serde_json::json!({"file_id": file_id})).await?;
+    let Some(file_path) = info["result"]["file_path"].as_str() else {
+        bail!("getFile returned no file_path");
+    };
+    let url = format!("https://api.telegram.org/file/bot{token}/{file_path}");
+    let bytes = http.get(&url).send().await?.error_for_status()?.bytes().await?;
+    let safe: String = file_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let dir = workspace.join("media").join("inbound");
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(format!("{}-{safe}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&dest, &bytes)?;
+    tracing::info!("document saved to {}", dest.display());
+    Ok(dest.to_string_lossy().into_owned())
 }
 
 /// Fetch a Telegram photo, store it under `<workspace>/media/inbound/`, and
