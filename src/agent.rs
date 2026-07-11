@@ -127,7 +127,13 @@ impl<'a> AgentRun<'a> {
             for call in tool_calls {
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = call.get("arguments").cloned().unwrap_or(json!({}));
-                let (details, is_error) = self.tools.dispatch(name, &args).await?;
+                // A failing tool must not abort the turn: feed the error back
+                // as an error result so the model can correct itself (e.g. a
+                // hallucinated absolute path hitting EACCES).
+                let (details, is_error) = match self.tools.dispatch(name, &args).await {
+                    Ok(r) => r,
+                    Err(e) => (json!({"error": format!("{e:#}")}), true),
+                };
                 let result_msg = json!({
                     "role": "toolResult",
                     "toolCallId": call.get("id"),
