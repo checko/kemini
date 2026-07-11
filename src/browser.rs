@@ -34,7 +34,7 @@ fn chrome_binary() -> Result<&'static str> {
     bail!("no Chrome/Chromium binary found (looked for {CHROME_CANDIDATES:?})")
 }
 
-fn base_args(profile_dir: &Path) -> Vec<String> {
+fn base_args(profile_dir: &Path, deadline_ms: u64) -> Vec<String> {
     vec![
         "--headless=new".into(),
         "--disable-gpu".into(),
@@ -42,8 +42,10 @@ fn base_args(profile_dir: &Path) -> Vec<String> {
         "--disable-extensions".into(),
         "--mute-audio".into(),
         format!("--user-data-dir={}", profile_dir.display()),
-        // Let SPA frameworks settle before dumping/rendering.
-        "--virtual-time-budget=8000".into(),
+        // Hard navigation deadline: ad-heavy pages (news portals) never go
+        // network-idle, so a settle-based budget hangs forever; --timeout
+        // makes Chrome dump/render whatever is there when the deadline hits.
+        format!("--timeout={deadline_ms}"),
     ]
 }
 
@@ -67,10 +69,12 @@ pub async fn rendered_text(
 ) -> Result<Value> {
     let profile = state_root.join("browser-profile");
     std::fs::create_dir_all(&profile)?;
-    let mut args = base_args(&profile);
+    let mut args = base_args(&profile, 15_000);
+    // Text extraction doesn't need images; skipping them speeds heavy pages.
+    args.push("--blink-settings=imagesEnabled=false".into());
     args.push("--dump-dom".into());
     args.push(url.to_string());
-    let out = run_chrome(args, 45).await?;
+    let out = run_chrome(args, 40).await?;
     if !out.status.success() && out.stdout.is_empty() {
         bail!(
             "chrome exited with {}: {}",
@@ -107,7 +111,8 @@ pub async fn screenshot(
     let dir = workspace.join("media").join("inbound");
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("browser-{}.png", uuid::Uuid::new_v4().simple()));
-    let mut args = base_args(&profile);
+    // Screenshots keep images on and get a longer deadline for rendering.
+    let mut args = base_args(&profile, 20_000);
     args.push("--window-size=1280,2000".into());
     args.push(format!("--screenshot={}", dest.display()));
     args.push(url.to_string());
