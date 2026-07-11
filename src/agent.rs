@@ -21,6 +21,11 @@ pub struct AgentRun<'a> {
     pub max_turns: usize,
     /// Max continuation nudges per turn (harness aid for weak local models).
     pub max_nudges: usize,
+    /// Token budget that triggers mid-turn compaction (80% of the model
+    /// context window; 0 disables). A long tool loop can blow past this
+    /// between the pre-turn and post-turn compaction checks, so we also
+    /// compact INSIDE the loop before each model call.
+    pub context_cap: i64,
 }
 
 pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
@@ -107,8 +112,40 @@ impl<'a> AgentRun<'a> {
         let mut edited_code = false;
         let mut verified_since_edit = false;
         let mut verify_nudges = 0usize;
+        let mut mid_turn_compactions = 0usize;
 
         'outer: for _ in 0..self.max_turns {
+            // Mid-turn compaction (Hermes layer 2): a long tool loop grows
+            // `history` by big tool results between the pre/post-turn durable
+            // checks and can reach the context window mid-turn — every call
+            // then returns length/empty. Estimate the pending request and, if
+            // over the cap, summarize the middle IN-MEMORY (protecting a prior
+            // summary + the recent tool activity the model needs to continue).
+            // Ephemeral: the durable transcript keeps everything; the next
+            // turn's pre-turn compaction persists it. Capped at 3/turn.
+            if self.context_cap > 0 && mid_turn_compactions < 3 {
+                // Include the system prompt (bootstrap files ≈ several k
+                // tokens) so the estimate is comparable to the real context
+                // the cap is measured against.
+                let est_tokens =
+                    estimate_tokens(&history) + (self.system_prompt.len() / 4) as i64;
+                if est_tokens > self.context_cap {
+                    match self.compact_history_in_memory(client, &history).await {
+                        Ok(Some(new_history)) => {
+                            tracing::info!(
+                                "mid-turn compaction: ~{est_tokens} tok > cap {} → {} msgs",
+                                self.context_cap,
+                                new_history.len()
+                            );
+                            history = new_history;
+                            mid_turn_compactions += 1;
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("mid-turn compaction failed (continuing): {e:#}"),
+                    }
+                }
+            }
+
             let (completion, used_ref) = self.complete_with_fallback(client, &history, &tool_specs).await?;
 
             let assistant_msg = json!({
@@ -251,6 +288,36 @@ impl<'a> AgentRun<'a> {
         Ok(final_text)
     }
 
+    /// Summarize the middle of `history` in-memory, protecting a leading
+    /// prior-summary message and the most recent `PROTECT_TAIL` messages
+    /// (the current turn's tool activity). Returns the shrunk history, or
+    /// None if there is too little middle to be worth compacting.
+    async fn compact_history_in_memory(
+        &self,
+        client: &LlmClient,
+        history: &[Value],
+    ) -> Result<Option<Vec<Value>>> {
+        const PROTECT_TAIL: usize = 6;
+        let Some(tail_start) = in_memory_compaction_split(history, PROTECT_TAIL) else {
+            return Ok(None); // nothing meaningful to compress
+        };
+        let target = resolve_target(self.config, &self.model_chain[0])?;
+        // Summarize head + middle; keep tail verbatim.
+        let summary =
+            crate::compaction::summarize_messages(client, &target, &history[..tail_start]).await?;
+
+        let mut out = Vec::with_capacity(PROTECT_TAIL + 1);
+        out.push(json!({
+            "role": "user",
+            "content": [{"type":"text","text": format!(
+                "[Conversation summary — earlier context was compacted mid-task]\n{summary}"
+            )}],
+            "timestamp": 0,
+        }));
+        out.extend_from_slice(&history[tail_start..]);
+        Ok(Some(out))
+    }
+
     async fn complete_with_fallback(
         &mut self,
         client: &LlmClient,
@@ -347,6 +414,35 @@ fn looks_unfinished(text: &str) -> bool {
     (has_intent || has_continuation) && !explicitly_finished
 }
 
+/// Decide where to split `history` for in-memory compaction: summarize
+/// `[..tail_start]`, keep `[tail_start..]` verbatim (the recent tool activity
+/// the model needs to continue). Returns None when there is too little middle
+/// to be worth compressing — the case where a single huge tool result sits in
+/// the protected tail (bounded elsewhere by the read/exec output caps).
+fn in_memory_compaction_split(history: &[Value], protect_tail: usize) -> Option<usize> {
+    let has_head = history.first().is_some_and(|m| {
+        m["content"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("[Conversation summary"))
+    });
+    let head = usize::from(has_head);
+    // Need at least one non-head, non-tail message to summarize.
+    if history.len() <= head + protect_tail + 1 {
+        return None;
+    }
+    Some(history.len() - protect_tail)
+}
+
+/// Rough token estimate of a message list (~4 chars/token, matching the
+/// Hermes char-based preflight). Counts serialized content only.
+fn estimate_tokens(history: &[Value]) -> i64 {
+    let chars: usize = history
+        .iter()
+        .map(|m| serde_json::to_string(&m["content"]).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    (chars / 4) as i64
+}
+
 /// Does this path look like runnable code (worth verifying after an edit)?
 /// Prose/config (.md, .txt, .json) is excluded so docs edits aren't nudged.
 fn is_code_file(path: &str) -> bool {
@@ -393,6 +489,28 @@ mod tests {
             "✅ Step 1 done — added _is_md_file() helper. Now verifying by reading back before continuing with next steps:"
         ));
         assert!(looks_unfinished("步驟 1 完成，接著處理下一步"));
+    }
+
+    #[test]
+    fn token_estimate_and_split() {
+        use serde_json::json;
+        let msg = |t: &str| json!({"content":[{"type":"text","text":t}]});
+        // estimate ≈ chars/4 of serialized content
+        let h = vec![msg(&"x".repeat(400))];
+        assert!(super::estimate_tokens(&h) >= 100);
+
+        // Too few messages → no split (single big result stays protected).
+        let few: Vec<_> = (0..4).map(|i| msg(&format!("m{i}"))).collect();
+        assert_eq!(super::in_memory_compaction_split(&few, 6), None);
+
+        // Enough messages → summarize all but the last `protect_tail`.
+        let many: Vec<_> = (0..12).map(|i| msg(&format!("m{i}"))).collect();
+        assert_eq!(super::in_memory_compaction_split(&many, 6), Some(6));
+
+        // Leading summary is treated as head, still protects the tail.
+        let mut with_head = vec![msg("[Conversation summary — prior]")];
+        with_head.extend((0..10).map(|i| msg(&format!("m{i}"))));
+        assert_eq!(super::in_memory_compaction_split(&with_head, 6), Some(5));
     }
 
     #[test]

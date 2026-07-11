@@ -136,29 +136,7 @@ async fn compact_inner(
     anyhow::ensure!(!chain.is_empty(), "no model configured");
     let target = crate::agent::resolve_target(&rt.loaded.config, &chain[0])?;
     let client = LlmClient::new();
-    // Bound the summarizer's input: a wedged session (history ≈ num_ctx)
-    // would otherwise leave the summarizer no room to generate, so it
-    // returns empty and compaction fails forever. Keep any prior summary
-    // message plus the most recent messages within a ~60k char budget
-    // (≈15k tokens) — enough to summarize well, small enough to always run.
-    let mut messages = bound_for_summary(&ctx.messages, 60_000);
-    messages.push(json!({
-        "role": "user",
-        "content": [{"type": "text", "text": SUMMARY_PROMPT}],
-        "timestamp": chrono::Utc::now().timestamp_millis(),
-    }));
-    let completion = client
-        .complete(&target, "You are a precise conversation summarizer.", &messages, &[])
-        .await
-        .context("summarization call failed")?;
-    let summary: String = completion
-        .content
-        .iter()
-        .filter(|c| c["type"] == json!("text"))
-        .filter_map(|c| c["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    anyhow::ensure!(!summary.trim().is_empty(), "model produced an empty summary");
+    let summary = summarize_messages(&client, &target, &ctx.messages).await?;
 
     // 3. compaction record: nothing kept — future context = summary +
     //    everything after this record.
@@ -178,6 +156,36 @@ async fn compact_inner(
         messages_summarized: ctx.messages.len(),
         compaction_count: count,
     }))
+}
+
+/// Summarize a message list into a single summary string. Input is bounded
+/// (prior summary + most recent messages within ~60k chars) so it always has
+/// generation headroom, even when the session is near the context limit.
+/// Reused by both durable compaction and the in-memory mid-turn layer.
+pub async fn summarize_messages(
+    client: &LlmClient,
+    target: &crate::providers::ModelTarget,
+    messages: &[Value],
+) -> Result<String> {
+    let mut input = bound_for_summary(messages, 60_000);
+    input.push(json!({
+        "role": "user",
+        "content": [{"type": "text", "text": SUMMARY_PROMPT}],
+        "timestamp": chrono::Utc::now().timestamp_millis(),
+    }));
+    let completion = client
+        .complete(target, "You are a precise conversation summarizer.", &input, &[])
+        .await
+        .context("summarization call failed")?;
+    let summary: String = completion
+        .content
+        .iter()
+        .filter(|c| c["type"] == json!("text"))
+        .filter_map(|c| c["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::ensure!(!summary.trim().is_empty(), "model produced an empty summary");
+    Ok(summary)
 }
 
 /// Keep the leading summary message (if the session was compacted before)

@@ -452,6 +452,7 @@ impl Runtime {
         let mut content = vec![serde_json::json!({"type":"text","text": text_with_context})];
         content.extend(image_parts);
 
+        let context_cap = compaction::context_cap(self, &chain[0]);
         let mut run = agent::AgentRun {
             config: &self.loaded.config,
             agent_id: self.agent_id.clone(),
@@ -460,6 +461,7 @@ impl Runtime {
             transcript: &mut transcript,
             tools: &tools_rt,
             system_prompt,
+            context_cap,
             model_chain: chain,
             max_turns: 24,
             max_nudges: 4,
