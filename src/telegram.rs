@@ -121,6 +121,13 @@ pub async fn run(
 
     let dm_policy = tg.dm_policy.clone().unwrap_or_else(|| "pairing".into());
     let gate = PairingGate::load(&rt.paths.root);
+    let model_override: Option<String> = model_override.map(String::from);
+    let image_model: Option<String> = image_model.map(String::from);
+    // One lock per session: turns for the same chat run in order, while the
+    // poller keeps receiving new updates (so a busy bot can say so).
+    let session_locks: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = Default::default();
 
     let mut offset: i64 = 0;
     loop {
@@ -209,21 +216,9 @@ pub async fn run(
                 format!("agent:{}:telegram:group:{}", rt.agent_id, chat_id)
             };
 
-            if text.trim() == "/compact" {
-                let reply = match crate::compaction::compact(&rt, &session_key, model_override).await {
-                    Ok(Some(s)) => format!(
-                        "🗜 Compacted: {} messages ({} tokens) → {} char summary.",
-                        s.messages_summarized, s.tokens_before, s.summary_chars
-                    ),
-                    Ok(None) => "Nothing to compact yet.".to_string(),
-                    Err(e) => format!("⚠️ compaction failed: {e:#}"),
-                };
-                let _ = send_message(&http, &base, chat_id, &reply).await;
-                continue;
-            }
-
             // Bare /new or /reset rolls the session and runs the npm-style
             // session-startup turn; `/new <text>` starts fresh with that text.
+            let is_compact = text.trim() == "/compact";
             let (fresh, body) = match text.trim() {
                 "/new" | "/reset" => (
                     true,
@@ -236,63 +231,144 @@ pub async fn run(
                 continue;
             }
 
-            let typing = serde_json::json!({"chat_id": chat_id, "action": "typing"});
-            let _ = api(&http, &base, "sendChatAction", typing).await;
-
-            // Download attached document; tell the model where it landed so
-            // it can use read (PDF/text) or exec on it.
-            let mut body = body;
-            if let Some((file_id, file_name)) = &document {
-                match download_document(&http, &base, token, file_id, file_name, &rt.workspace()).await {
-                    Ok(path) => {
-                        body = format!("[Attached file saved at: {path}]\n{body}");
-                    }
-                    Err(e) => {
-                        tracing::warn!("document download failed: {e:#}");
-                        let _ = send_message(&http, &base, chat_id, "⚠️ could not download the attached file").await;
-                        continue;
-                    }
-                }
+            // Everything slow runs in a spawned task under the session lock,
+            // so the poller stays responsive and can acknowledge a busy chat.
+            let lock = session_locks
+                .lock()
+                .unwrap()
+                .entry(session_key.clone())
+                .or_default()
+                .clone();
+            let busy = lock.try_lock().is_err();
+            if busy {
+                let _ = send_message(
+                    &http, &base, chat_id,
+                    "⏳ Still working on your previous message — I'll take this one right after.",
+                ).await;
             }
 
-            // Download attached photo into the workspace and build an image part.
-            let mut images = Vec::new();
-            let mut turn_model = model_override;
-            if let Some(file_id) = &photo_file_id {
-                match download_photo(&http, &base, token, file_id, &rt.workspace()).await {
-                    Ok(part) => {
-                        images.push(part);
-                        // Vision turns go to the image model when configured.
-                        if image_model.is_some() {
-                            turn_model = image_model;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("photo download failed: {e:#}");
-                        let _ = send_message(&http, &base, chat_id, "⚠️ could not download the photo").await;
-                        continue;
-                    }
-                }
-            }
+            let http = http.clone();
+            let base = base.clone();
+            let token = token.clone();
+            let rt = rt.clone();
+            let model_override = model_override.clone();
+            let image_model = image_model.clone();
+            tokio::spawn(async move {
+                let _guard = lock.lock().await;
 
-            match rt
-                .run_message_parts(&session_key, &body, images, fresh, turn_model)
-                .await
-            {
-                Ok(reply) if !reply.is_empty() => {
-                    for chunk in split_message(&reply, 4000) {
-                        if let Err(e) = send_message(&http, &base, chat_id, &chunk).await {
-                            tracing::warn!("sendMessage failed: {e:#}");
-                        }
+                // Keep the "typing…" indicator alive for the whole turn
+                // (telegram expires a single sendChatAction after ~5s).
+                let typing_http = http.clone();
+                let typing_base = base.clone();
+                let typing = tokio::spawn(async move {
+                    loop {
+                        let _ = api(
+                            &typing_http, &typing_base, "sendChatAction",
+                            serde_json::json!({"chat_id": chat_id, "action": "typing"}),
+                        ).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
+                });
+
+                let outcome = handle_turn(
+                    &http, &base, &token, &rt, chat_id, &session_key,
+                    is_compact, fresh, body, photo_file_id, document,
+                    model_override.as_deref(), image_model.as_deref(),
+                ).await;
+                typing.abort();
+                if let Err(e) = outcome {
+                    tracing::warn!("turn failed: {e:#}");
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    let _ = send_message(&http, &base, chat_id, &format!("⚠️ error: {e:#}")).await;
-                }
+            });
+        }
+    }
+}
+
+/// One full chat turn: attachments, command handling, model run, reply.
+#[allow(clippy::too_many_arguments)]
+async fn handle_turn(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    rt: &std::sync::Arc<Runtime>,
+    chat_id: i64,
+    session_key: &str,
+    is_compact: bool,
+    fresh: bool,
+    body: String,
+    photo_file_id: Option<String>,
+    document: Option<(String, String)>,
+    model_override: Option<&str>,
+    image_model: Option<&str>,
+) -> Result<()> {
+    if is_compact {
+        let reply = match crate::compaction::compact(rt, session_key, model_override).await {
+            Ok(Some(s)) => format!(
+                "🗜 Compacted: {} messages ({} tokens) → {} char summary.",
+                s.messages_summarized, s.tokens_before, s.summary_chars
+            ),
+            Ok(None) => "Nothing to compact yet.".to_string(),
+            Err(e) => format!("⚠️ compaction failed: {e:#}"),
+        };
+        let _ = send_message(http, base, chat_id, &reply).await;
+        return Ok(());
+    }
+
+    // Download attached document; tell the model where it landed so it can
+    // use read (PDF/text) or exec on it.
+    let mut body = body;
+    if let Some((file_id, file_name)) = &document {
+        match download_document(http, base, token, file_id, file_name, &rt.workspace()).await {
+            Ok(path) => body = format!("[Attached file saved at: {path}]\n{body}"),
+            Err(e) => {
+                tracing::warn!("document download failed: {e:#}");
+                let _ = send_message(http, base, chat_id, "⚠️ could not download the attached file").await;
+                return Ok(());
             }
         }
     }
+
+    // Download attached photo into the workspace and build an image part.
+    let mut images = Vec::new();
+    let mut turn_model = model_override;
+    if let Some(file_id) = &photo_file_id {
+        match download_photo(http, base, token, file_id, &rt.workspace()).await {
+            Ok(part) => {
+                images.push(part);
+                // Vision turns go to the image model when configured.
+                if image_model.is_some() {
+                    turn_model = image_model;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("photo download failed: {e:#}");
+                let _ = send_message(http, base, chat_id, "⚠️ could not download the photo").await;
+                return Ok(());
+            }
+        }
+    }
+
+    match rt
+        .run_message_parts(session_key, &body, images, fresh, turn_model)
+        .await
+    {
+        Ok(reply) if !reply.is_empty() => {
+            for chunk in split_message(&reply, 4000) {
+                if let Err(e) = send_message(http, base, chat_id, &chunk).await {
+                    tracing::warn!("sendMessage failed: {e:#}");
+                }
+            }
+        }
+        // Tools ran but the model produced no final text: say so instead of
+        // silence (silence is indistinguishable from a hang for the user).
+        Ok(_) => {
+            let _ = send_message(http, base, chat_id, "✅ done (no text output)").await;
+        }
+        Err(e) => {
+            let _ = send_message(http, base, chat_id, &format!("⚠️ error: {e:#}")).await;
+        }
+    }
+    Ok(())
 }
 
 /// Fetch a Telegram document attachment into `<workspace>/media/inbound/`,
