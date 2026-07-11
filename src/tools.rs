@@ -128,6 +128,39 @@ impl ToolRuntime {
                 }),
             },
             ToolSpec {
+                name: "browser_open".into(),
+                description: "Open a URL in a headless browser (JavaScript executes) and return the rendered page text. Use when web_fetch returns empty/incomplete content for JS-heavy pages.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "maxChars": {"type": "number", "description": "max characters returned (default 20000)"}
+                    },
+                    "required": ["url"]
+                }),
+            },
+            ToolSpec {
+                name: "browser_screenshot".into(),
+                description: "Render a URL in a headless browser and save a PNG screenshot. Returns the saved file path.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }),
+            },
+            ToolSpec {
+                name: "browser_look".into(),
+                description: "Screenshot a URL and ask the vision model a question about what the page LOOKS like (layout, images, charts, visual state). For plain text content prefer browser_open.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "question": {"type": "string", "description": "what to look for/describe"}
+                    },
+                    "required": ["url", "question"]
+                }),
+            },
+            ToolSpec {
                 name: "session_status".into(),
                 description: "Get the current date/time and session status (agent, session, model, workspace). Use this whenever you need the live clock.".into(),
                 parameters: json!({
@@ -184,6 +217,9 @@ impl ToolRuntime {
             "memory_get" => self.memory_get(args),
             "web_search" => self.web_search(args).await,
             "web_fetch" => self.web_fetch(args).await,
+            "browser_open" => self.browser_open(args).await,
+            "browser_screenshot" => self.browser_screenshot(args).await,
+            "browser_look" => self.browser_look(args).await,
             "session_status" => Ok(self.session_status()),
             "cron" => self.cron(args).await,
             "sessions_spawn" => self.sessions_spawn(args),
@@ -541,6 +577,47 @@ impl ToolRuntime {
         let recent = args["recentMinutes"].as_i64();
         let runs = store.list(recent)?;
         Ok((json!({"runs": runs, "count": runs.len()}), false))
+    }
+
+    async fn browser_open(&self, args: &Value) -> Result<(Value, bool)> {
+        let (Some(rt), Some(url)) = (&self.runtime, args["url"].as_str()) else {
+            return Ok((json!({"error":"missing url or runtime"}), true));
+        };
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Ok((json!({"error":"only http(s) URLs are supported"}), true));
+        }
+        let max = args["maxChars"].as_u64().unwrap_or(20_000) as usize;
+        match crate::browser::rendered_text(&rt.paths.root, url, max.clamp(500, 100_000)).await {
+            Ok(v) => Ok((v, false)),
+            Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
+        }
+    }
+
+    async fn browser_screenshot(&self, args: &Value) -> Result<(Value, bool)> {
+        let (Some(rt), Some(url)) = (&self.runtime, args["url"].as_str()) else {
+            return Ok((json!({"error":"missing url or runtime"}), true));
+        };
+        match crate::browser::screenshot(&rt.paths.root, &self.workspace, url).await {
+            Ok(path) => Ok((
+                json!({"url": url, "screenshotPath": path.to_string_lossy()}),
+                false,
+            )),
+            Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
+        }
+    }
+
+    async fn browser_look(&self, args: &Value) -> Result<(Value, bool)> {
+        let (Some(rt), Some(url), Some(q)) = (
+            &self.runtime,
+            args["url"].as_str(),
+            args["question"].as_str(),
+        ) else {
+            return Ok((json!({"error":"missing url/question or runtime"}), true));
+        };
+        match crate::browser::look(rt, url, q).await {
+            Ok(v) => Ok((v, false)),
+            Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
+        }
     }
 
     fn session_status(&self) -> (Value, bool) {

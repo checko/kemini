@@ -1,4 +1,5 @@
 mod agent;
+mod browser;
 mod compaction;
 mod config;
 mod cron;
