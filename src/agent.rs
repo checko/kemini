@@ -137,21 +137,22 @@ impl<'a> AgentRun<'a> {
             }
 
             if tool_calls.is_empty() {
-                // Continuation nudge: weak models often read a file, announce
-                // "now let me implement X", and stop WITHOUT doing it. If the
-                // model already used tools this turn and its final text reads
-                // like an unfinished plan, prod it once to actually execute.
-                if tools_ran > 0
-                    && nudges_used < self.max_nudges
-                    && looks_unfinished(&final_text)
-                {
+                // Continuation nudge: weak models stop mid-task, e.g. "Step 1
+                // done, now verifying before continuing" — with NO tool call.
+                // Fire when the reply signals more work is coming (intent or
+                // step markers), regardless of whether tools ran this turn or
+                // whether the word "done" appears (it usually refers to a
+                // sub-step). Capped at max_nudges so it can't loop.
+                if nudges_used < self.max_nudges && looks_unfinished(&final_text) {
                     nudges_used += 1;
                     let nudge = json!({
                         "role": "user",
                         "content": [{"type":"text","text":
-                            "You described what you will do but did not do it. Perform the change NOW \
-                             using the edit/write/exec tools, then report what you actually changed. \
-                             Do not just restate the plan."}],
+                            "You described a step or plan but did not execute it — there was no tool \
+                             call. Do the next concrete action NOW with a tool (edit/write/exec), and \
+                             keep going until the whole task is finished and verified. If you claimed a \
+                             step is done, prove it by reading or running the result. Do not reply with \
+                             another plan."}],
                         "timestamp": chrono::Utc::now().timestamp_millis(),
                     });
                     history.push(nudge);
@@ -274,22 +275,39 @@ fn resolve_api(config: &Config, model_ref: &str) -> String {
         .unwrap_or_else(|_| "openai-completions".into())
 }
 
-/// Heuristic: does this final reply describe an intended action rather than
-/// report a completed one? Used to decide whether to nudge a stalled model.
-/// Conservative — only fires on explicit intent phrases, so genuine answers
-/// (which report results in past tense) are left alone.
+/// Heuristic: does this final reply signal that more work is coming (an
+/// intended action or a mid-sequence step) rather than a finished task?
+/// Used to decide whether to nudge a stalled model.
+///
+/// Two signal classes:
+///  - INTENT: "let me…", "I'll…", "接下來…" — announcing a next action.
+///  - CONTINUATION: "step 1", "next step", "before continuing", "verifying"
+///    — mid-multi-step markers. These fire even when the reply also contains
+///    "done", because weak models write "Step 1 done, now continuing…" and
+///    the old `!has_done` guard let that stall through.
+///
+/// A reply is treated as FINISHED (no nudge) only when it has a completion
+/// marker AND no continuation marker — a plain past-tense report.
 fn looks_unfinished(text: &str) -> bool {
     let t = text.to_lowercase();
     const INTENT: &[&str] = &[
         "let me", "i'll ", "i will ", "i'm going to", "next, i", "now i'll",
         "let's ", "going to implement", "let me implement", "i plan to",
-        "接下來", "讓我", "我將", "我會", "現在來", "準備", "打算",
+        "接下來", "讓我", "我將", "我會", "現在來", "打算",
     ];
-    // "done"/"completed" style words suggest it actually finished.
-    const DONE: &[&str] = &["done", "完成", "已", "changed", "updated", "created", "fixed", "wrote"];
+    const CONTINUATION: &[&str] = &[
+        "next step", "before continuing", "continuing with", "now verifying",
+        "verify by reading", "verifying by", "step 1", "step 2", "step 3",
+        "remaining step", "then i", "下一步", "步驟", "接著", "繼續",
+    ];
+    const FINISHED: &[&str] = &[
+        "all tests pass", "task complete", "fully done", "全部完成", "任務完成",
+        "everything works", "verified working", "已測試通過",
+    ];
     let has_intent = INTENT.iter().any(|p| t.contains(p));
-    let has_done = DONE.iter().any(|p| t.contains(p));
-    has_intent && !has_done
+    let has_continuation = CONTINUATION.iter().any(|p| t.contains(p));
+    let explicitly_finished = FINISHED.iter().any(|p| t.contains(p));
+    (has_intent || has_continuation) && !explicitly_finished
 }
 
 fn tool_result_render(details: &Value) -> String {
@@ -320,11 +338,20 @@ mod tests {
     }
 
     #[test]
+    fn detects_step_done_but_continuing() {
+        // The exact real failure: sub-step "done" + continuation marker.
+        assert!(looks_unfinished(
+            "✅ Step 1 done — added _is_md_file() helper. Now verifying by reading back before continuing with next steps:"
+        ));
+        assert!(looks_unfinished("步驟 1 完成，接著處理下一步"));
+    }
+
+    #[test]
     fn accepts_completed_replies() {
-        // Past-tense / done markers mean it finished — no nudge.
-        assert!(!looks_unfinished("Done — I updated utils.py with render_markdown."));
-        assert!(!looks_unfinished("已完成，已修改 viewer。"));
+        // Genuinely finished — no continuation marker.
         assert!(!looks_unfinished("The kernel is 6.17.0-35-generic."));
-        assert!(!looks_unfinished("I changed the viewer; let me know if you want more."));
+        assert!(!looks_unfinished("I updated utils.py with render_markdown; all tests pass."));
+        assert!(!looks_unfinished("任務完成，已測試通過。"));
+        assert!(!looks_unfinished("Here are the first three headlines: A, B, C."));
     }
 }

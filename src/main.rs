@@ -430,7 +430,7 @@ impl Runtime {
             system_prompt,
             model_chain: chain,
             max_turns: 24,
-            max_nudges: 2,
+            max_nudges: 4,
         };
         let client = providers::LlmClient::new();
         let reply = run.run_turn(&client, content).await?;

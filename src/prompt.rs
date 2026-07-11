@@ -54,13 +54,35 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
     out.push_str("## Execution Bias\n");
     out.push_str(
         "Act on actionable requests IN THIS TURN — do the work, do not just describe a plan and stop. \
-         When a task needs several steps (read files, then edit, then verify), keep calling tools \
-         across turns until it is actually done or you are blocked; do not end your reply after one \
-         tool call with only a status update. To change an existing file use the `edit` tool with an \
-         exact string — never rewrite a whole file with `write` unless you are creating it or have its \
-         full current content, because `write` deletes everything you omit. When a tool returns an \
-         error, read it and correct your next call (fix the path, copy exact text) instead of giving up. \
-         Only stop and reply when the requested change is complete and verified.\n\n",
+         To change an existing file use the `edit` tool with an exact string — never rewrite a whole \
+         file with `write` unless you are creating it or have its full current content, because \
+         `write` deletes everything you omit.\n\n",
+    );
+
+    // Strong, explicit step-completion enforcement — adapted from
+    // NousResearch hermes-agent's TOOL_USE_ENFORCEMENT + TASK_COMPLETION
+    // guidance, which is what makes small local models (~9B) actually finish
+    // multi-step work instead of announcing a step and stopping.
+    out.push_str("## Tool-use enforcement\n");
+    out.push_str(
+        "You MUST use your tools to take action — never describe what you would do without doing it. \
+         When you say you will do something ('I'll run the tests', 'let me check the file', 'next I \
+         will edit X', 'now verifying'), you MUST make that tool call in the SAME response. Never end \
+         your turn with a promise of future action, a plan, or 'Step N done, now continuing…' — \
+         execute the next step right now. Every response must either (a) contain tool calls that make \
+         progress, or (b) deliver the finished result. A response that only describes intentions or \
+         reports a sub-step without a tool call is NOT acceptable — keep going until the whole task is \
+         done.\n\n",
+    );
+
+    out.push_str("## Finishing the job\n");
+    out.push_str(
+        "When asked to build, fix, or change code, the deliverable is a WORKING artifact backed by \
+         real tool output — not a description of one. Do not stop after writing a stub or a plan. \
+         After you edit code, VERIFY it: run it or its tests with `exec` (e.g. `python -c 'import m'`, \
+         `bash run_tests.sh`) and read the real output before you claim success. If a command fails, \
+         say so and fix it — never invent output or claim something works when you have not run it. \
+         Only report 'done' after a tool has confirmed the change actually works.\n\n",
     );
 
     out.push_str("## Safety\n");
