@@ -252,7 +252,7 @@ fn truncate_chars(text: &mut String, max_chars: usize) -> bool {
 
 /// Small dependency-free HTML → text reduction: drop script/style, strip
 /// tags, decode common entities, collapse blank lines.
-fn html_to_text(html: &str) -> String {
+pub fn html_to_text(html: &str) -> String {
     // The regex crate has no backreferences — one pattern per container tag.
     let mut cleaned = html.to_string();
     for tag in ["script", "style", "noscript", "svg", "head"] {
