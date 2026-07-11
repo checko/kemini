@@ -223,6 +223,12 @@ impl ToolRuntime {
     }
 
     fn resolve(&self, p: &str) -> PathBuf {
+        // `~` must expand like the npm tools do — models routinely pass
+        // `~/dir/file` and silently joining it to the workspace produces a
+        // bogus ENOENT for paths that exist.
+        if p == "~" || p.starts_with("~/") {
+            return crate::paths::expand_tilde(p);
+        }
         let path = Path::new(p);
         if path.is_absolute() {
             path.to_path_buf()
@@ -235,7 +241,34 @@ impl ToolRuntime {
         let Some(p) = args.get("path").and_then(Value::as_str) else {
             return Ok((json!({"error":"missing path"}), true));
         };
-        match std::fs::read_to_string(self.resolve(p)) {
+        let resolved = self.resolve(p);
+        if resolved.is_dir() {
+            // Reading a directory: return its listing instead of a cryptic
+            // EISDIR — models often probe folders through `read`.
+            let mut names: Vec<String> = std::fs::read_dir(&resolved)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| {
+                            let mut n = e.file_name().to_string_lossy().into_owned();
+                            if e.path().is_dir() {
+                                n.push('/');
+                            }
+                            n
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            return Ok((
+                json!({
+                    "path": resolved.to_string_lossy(),
+                    "isDirectory": true,
+                    "entries": names,
+                }),
+                false,
+            ));
+        }
+        match std::fs::read_to_string(&resolved) {
             Ok(text) => {
                 let lines: Vec<&str> = text.lines().collect();
                 let start = args
@@ -253,7 +286,12 @@ impl ToolRuntime {
                 bound(&mut body, 60_000);
                 Ok((json!({"content": body}), false))
             }
-            Err(e) => Ok((json!({"error": e.to_string()}), true)),
+            // Include the resolved path so a bad path is debuggable from
+            // the transcript instead of looking like missing data.
+            Err(e) => Ok((
+                json!({"error": format!("{e} (resolved path: {})", resolved.display())}),
+                true,
+            )),
         }
     }
 
