@@ -50,7 +50,7 @@ impl ToolRuntime {
             },
             ToolSpec {
                 name: "read".into(),
-                description: "Read a file (workspace-relative or absolute path).".into(),
+                description: "Read a file (workspace-relative, absolute, or ~ path). PDFs are converted to text automatically; directories return their entries.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -268,6 +268,14 @@ impl ToolRuntime {
                 false,
             ));
         }
+        // PDFs: extract text via pdftotext (poppler) instead of failing on
+        // binary content.
+        if resolved
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        {
+            return Ok(self.read_pdf(&resolved, args));
+        }
         match std::fs::read_to_string(&resolved) {
             Ok(text) => {
                 let lines: Vec<&str> = text.lines().collect();
@@ -292,6 +300,54 @@ impl ToolRuntime {
                 json!({"error": format!("{e} (resolved path: {})", resolved.display())}),
                 true,
             )),
+        }
+    }
+
+    fn read_pdf(&self, resolved: &Path, args: &Value) -> (Value, bool) {
+        let out = std::process::Command::new("pdftotext")
+            .arg("-layout")
+            .arg(resolved)
+            .arg("-") // stdout
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let lines: Vec<&str> = text.lines().collect();
+                let start = args
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .map(|v| (v as usize).saturating_sub(1))
+                    .unwrap_or(0)
+                    .min(lines.len());
+                let end = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|l| (start + l as usize).min(lines.len()))
+                    .unwrap_or(lines.len());
+                let mut body = lines[start..end].join("\n");
+                bound(&mut body, 60_000);
+                (
+                    json!({
+                        "content": body,
+                        "sourceFormat": "pdf",
+                        "totalLines": lines.len(),
+                    }),
+                    false,
+                )
+            }
+            Ok(o) => (
+                json!({"error": format!(
+                    "pdftotext failed: {}",
+                    String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>()
+                )}),
+                true,
+            ),
+            Err(e) => (
+                json!({"error": format!(
+                    "cannot extract PDF text ({e}); install poppler-utils (pdftotext)"
+                )}),
+                true,
+            ),
         }
     }
 
