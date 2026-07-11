@@ -51,6 +51,13 @@ cargo build --release
 `OPENCLAW_STATE_DIR=/path/to/state` overrides the state dir (useful for testing
 against a copy before pointing it at the real one).
 
+### Choosing models (local Ollama vs OpenRouter/remote)
+
+See **[docs/MODEL-SELECTION.md](docs/MODEL-SELECTION.md)** for the full
+rules: provider declaration vs selection, the `--model` / config
+precedence, image-model routing, API-key lookup, why `contextWindow`
+must match the served `num_ctx`, and single-daemon restart hygiene.
+
 ### Local test model
 
 For fully-local testing the repo was validated with **Ornith 1.0 9B**
