@@ -174,20 +174,39 @@ impl<'a> AgentRun<'a> {
                     continue;
                 }
             };
-            match client
-                .complete(&target, &self.system_prompt, history, tools)
-                .await
-            {
-                Ok(c) => return Ok((c, model_ref.clone())),
-                Err(e) => {
-                    tracing::warn!("model {model_ref} failed: {e:#}");
-                    // Record the fallback step like the npm runtime does.
-                    let mut body = serde_json::Map::new();
-                    body.insert("from".into(), json!(model_ref));
-                    body.insert("error".into(), json!(format!("{e:#}")));
-                    body.insert("at".into(), json!(iso_now()));
-                    let _ = self.transcript.append_record("model.fallback_step", body);
-                    last_err = Some(e);
+            // Transient failures (5xx, dropped connections) get one retry on
+            // the SAME model before failing over: a crashed local runner
+            // (e.g. ollama CUDA error) respawns within seconds, and the
+            // configured fallbacks may be unreachable hosts.
+            for attempt in 0..2 {
+                match client
+                    .complete(&target, &self.system_prompt, history, tools)
+                    .await
+                {
+                    Ok(c) => return Ok((c, model_ref.clone())),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let transient = msg.contains("HTTP 5")
+                            || msg.contains("error sending request")
+                            || msg.contains("connection closed")
+                            || msg.contains("operation timed out");
+                        if transient && attempt == 0 {
+                            tracing::warn!(
+                                "model {model_ref} transient failure, retrying in 3s: {msg}"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            continue;
+                        }
+                        tracing::warn!("model {model_ref} failed: {msg}");
+                        // Record the fallback step like the npm runtime does.
+                        let mut body = serde_json::Map::new();
+                        body.insert("from".into(), json!(model_ref));
+                        body.insert("error".into(), json!(msg));
+                        body.insert("at".into(), json!(iso_now()));
+                        let _ = self.transcript.append_record("model.fallback_step", body);
+                        last_err = Some(e);
+                        break;
+                    }
                 }
             }
         }
