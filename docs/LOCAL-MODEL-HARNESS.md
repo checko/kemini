@@ -23,12 +23,26 @@ and a 9B rewriting from memory truncates it, deleting working code. `edit`
 lets it change one region. Guards: if `oldText` is missing → error telling
 it to read/copy exact text; if ambiguous (multiple matches) → error asking
 for more context or `replaceAll`. The model self-corrects from these instead
-of clobbering. `src/tools.rs`.
+of clobbering. **Argument aliasing:** models trained on other harnesses pass
+`file_path`/`file` for `path`, or `old_string`/`new_string` for
+`oldText`/`newText`; kemini accepts those aliases (and stringifies numeric
+values) so a bare key-name mismatch doesn't wedge the turn. Missing-argument
+errors are instructive — they name the exact required keys and show an example
+call. Applies to `read`/`write`/`edit`/`memory_get`. `src/tools.rs`
+(`arg_str`, `PATH_KEYS`).
 
-### 2. Tool errors are recoverable, not fatal
+### 2. Tool errors are recoverable, not fatal (with a loop-breaker)
 A failing tool (bad path → EACCES, missing file) returns an `isError`
 tool-result to the model instead of aborting the whole turn. The model reads
-the error and fixes its next call. `src/agent.rs`.
+the error and fixes its next call. But a confused 9B sometimes repeats the
+*same* failing call instead of learning — observed live as `read {}` / `write
+{}` with empty arguments spun ~15× until the turn cap, producing garbage and
+never replying. So kemini counts consecutive errored tool calls: at 3 it
+injects one forceful correction ("STOP — do not repeat the same call; read
+the error, which names the required parameters"), and at 6 it aborts the turn
+with an honest reply ("I got stuck — my last N tool calls failed … nothing was
+changed") instead of spinning. Any successful tool call resets the counter.
+`src/agent.rs` (`consec_tool_errors`).
 
 ### 3. Continuation nudge
 Weak models frequently read a file, say "✅ Step 1 done, now verifying
@@ -67,9 +81,41 @@ Reasoning models (official Ornith) can spend their whole output budget on
 (16384 for Ornith) in `openclaw.json` so visible text remains after thinking.
 
 ### 8. Bounded tool output
-`read`/`exec` results are truncated (60 KB / 40 KB) so one big file cannot
-swamp a small context window. `read` on a directory returns a listing;
-`~` and PDF handling avoid dead-end errors.
+`read`/`exec` results are truncated (60 KB / 40 KB, stderr 10 KB) so one big
+file cannot swamp a small context window. `read` on a directory returns a
+listing; `~` and PDF handling avoid dead-end errors.
+
+### 9. Empty-reply nudge (thinking-only turns)
+A reasoning model can "think out loud" in its hidden reasoning channel ("let
+me search memory… now I should use exec…") and then END its turn with no
+visible text AND no tool call. The user sees nothing ("done (no text
+output)"). Because the thinking is never shown, an empty reply is never a
+valid finish: kemini detects a turn with no visible text and no tool call and
+nudges the model (up to 2×) to either make the tool call it was about to make
+or write the actual answer. This is model-agnostic, so it catches cases the
+keyword-based continuation nudge (#3) can't — there is no visible text to
+match on. `src/agent.rs` (`has_visible_text`, `empty_reply_nudges`).
+
+### 10. `max_turns` pause note
+A turn is capped at `max_turns` model↔tool round-trips (default 24). If the
+model is still working when it hits the cap, its last text is an intermediate
+step, not a conclusion — which looks like "it said it would do X but stopped".
+kemini distinguishes hitting the cap from a natural finish and appends a note
+to the reply: "⏳ I paused after N steps (my per-message limit) and I'm not
+done yet — reply 'continue'." The note is added to the delivered reply only;
+the transcript keeps the raw messages, so a follow-up "continue" resumes from
+the real state. `src/agent.rs` (`ran_to_limit`).
+
+### 11. Mid-turn compaction
+A long tool loop can grow the context past the window *between* the pre-turn
+and post-turn compaction checks — after which every call returns empty/length.
+Before each model call inside the loop, kemini estimates the pending request
+and, if over the cap, summarizes the middle of the history in-memory
+(protecting a leading prior-summary + the recent tail the model needs to
+continue), up to 3×/turn. The durable transcript keeps everything; the next
+turn's compaction persists it. This is layer 2 of a three-layer defense
+(pre-turn / mid-turn / post-turn). `src/agent.rs` (`compact_history_in_memory`),
+`src/compaction.rs`.
 
 ## Tuning knobs (openclaw.json)
 
@@ -87,6 +133,10 @@ reminders, and single-file changes. Large multi-file refactors remain slow
 heavy coding on non-sensitive data, a strong remote model (see
 MODEL-SELECTION.md) is still faster and more reliable; keep the local model
 for the sensitive work it exists to protect.
+
+Two hermes-agent techniques are **not yet ported**: a `todo`/planning tool,
+and progressive tool disclosure (subsetting the tool list when it grows past a
+fraction of the context). The full tool set is always exposed.
 
 ## Recommended local setup
 

@@ -31,7 +31,9 @@ workspace/                       # default agent workspace (agents.defaults.work
   openclaw-workspace-state.json  # {"version":1,"bootstrapSeededAt":...,"setupCompletedAt":...}
 memory/<agentId>.sqlite          # memory search index (see schema below)
 credentials/ identity/ devices/  # channel credentials & device pairing
-cron/ tasks/ flows/              # scheduled work
+cron/ tasks/ flows/              # scheduled-work JSON (legacy-migration only)
+state/openclaw.sqlite            # canonical cron/subagent store: cron_jobs,
+                                 #   cron_run_logs, subagent_runs tables (WAL)
 logs/                            # log files
 exec-approvals.json              # exec approval decisions
 update-check.json
@@ -100,6 +102,9 @@ One JSON record per line. Records share `{id: 8-hex, parentId: 8-hex|null, times
 - `{"type":"custom","customType":"openclaw:prompt-error","data":...}`
 - `{"type":"custom_message", ...}`
 - `{"type":"model.fallback_step", ...}`
+- `{"type":"compaction","summary":"...","firstKeptEntryId":<8-hex|null>,"tokensBefore":<int>}`
+  — the summary replaces all history up to `firstKeptEntryId` (null = nothing
+  kept); written and read back on context load during compaction
 - `{"type":"message","message":{...}}` where message is one of:
   - user: `{role:"user",content:[{type:"text",text}|{type:"image",...}],timestamp(ms)}`
   - assistant: `{role:"assistant",content:[{type:"thinking",thinking,thinkingSignature?}|
@@ -132,9 +137,10 @@ embeddings are stored as JSON-in-TEXT when a provider is configured.
 
 ## System prompt bootstrap injection
 
-Files injected in order: AGENTS.md, SOUL.md, TOOLS.md, IDENTITY.md, USER.md,
-HEARTBEAT.md (when heartbeats enabled), BOOTSTRAP.md (new workspaces only),
-MEMORY.md (when present). Per-file cap `agents.defaults.bootstrapMaxChars`
+Files injected in order (npm `CONTEXT_FILE_ORDER`): AGENTS.md, SOUL.md,
+IDENTITY.md, USER.md, TOOLS.md, BOOTSTRAP.md (new workspaces only), MEMORY.md
+(when present), HEARTBEAT.md (rendered last, when heartbeats enabled).
+Per-file cap `agents.defaults.bootstrapMaxChars`
 (default 20000), total cap `bootstrapTotalMaxChars` (default 60000), truncation
 marker + missing-file marker. `memory/*.md` NOT injected (on-demand via
 memory_search/memory_get; recent daily notes may be prepended one-shot after

@@ -71,9 +71,11 @@ echo "ollama version: $NEW_VERSION"
 say "4/6 Pulling official ornith:9b (resumes partial layers automatically)"
 ollama pull ornith:9b
 
-# Honor the KV-tune drop-in when present: q8_0 KV pays for a 32k window.
-CTX=24576
-[ -f /etc/systemd/system/ollama.service.d/kv-tune.conf ] && CTX=32768
+# Context window sized to the measured 8 GB VRAM ceiling: f16 KV fits ~40960
+# at 100% GPU; the q8_0 KV-tune drop-in (scripts/tune-ollama-kv.sh) halves KV
+# so it fits 65536. Match tune-ollama-kv.sh (CTX=65536) when that drop-in is on.
+CTX=40960
+[ -f /etc/systemd/system/ollama.service.d/kv-tune.conf ] && CTX=65536
 
 say "5/6 Rebuilding ornith-1.0-9b-q4 (num_ctx $CTX) from the official model"
 TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
@@ -104,4 +106,4 @@ case "$REPLY" in
 esac
 echo
 echo "kemini needs no config change (same model name/endpoint)."
-echo "If ctx is now 32768, tell kemini to bump the config contextWindow to match."
+echo "Set the config contextWindow for ollama-localhost/ornith-1.0-9b-q4 to $CTX to match num_ctx."
