@@ -242,12 +242,18 @@ impl LlmClient {
                 _ => {}
             }
         }
+        // The responses API is used in STREAMING mode: some servers (e.g. the
+        // gpt-5.5 passthrough this config targets) reject `stream:false` with
+        // 400 "Stream must be set to true". We don't need incremental tokens —
+        // the terminal `response.completed`/`response.incomplete` SSE event
+        // carries the FULL response object (output[], usage, status), the same
+        // shape a non-streaming reply would return — so we assemble from that.
         let mut body = json!({
             "model": t.model_id,
             "instructions": system,
             "input": input,
             "max_output_tokens": t.max_tokens,
-            "stream": false,
+            "stream": true,
             "store": false,
         });
         if !tools.is_empty() {
@@ -266,50 +272,15 @@ impl LlmClient {
         if let Some(k) = &t.api_key {
             req = req.bearer_auth(k);
         }
-        let resp: Value = check(req.send().await?).await?;
-        let mut content = Vec::new();
-        for item in resp["output"].as_array().unwrap_or(&vec![]) {
-            match item.get("type").and_then(Value::as_str) {
-                Some("message") => {
-                    for c in item["content"].as_array().unwrap_or(&vec![]) {
-                        if c.get("type").and_then(Value::as_str) == Some("output_text") {
-                            content.push(json!({"type":"text","text":c["text"]}));
-                        }
-                    }
-                }
-                Some("reasoning") => {
-                    content.push(json!({
-                        "type":"thinking","thinking":"",
-                        "thinkingSignature": serde_json::to_string(item).unwrap(),
-                    }));
-                }
-                Some("function_call") => {
-                    let args = item["arguments"].as_str().unwrap_or("{}");
-                    content.push(json!({
-                        "type":"toolCall",
-                        "id": item["call_id"],
-                        "name": item["name"],
-                        "arguments": serde_json::from_str::<Value>(args).unwrap_or(json!({})),
-                    }));
-                }
-                _ => {}
-            }
+        let http = req.send().await?;
+        let status = http.status();
+        let text = http.text().await?;
+        if !status.is_success() {
+            // Errors come back as a plain JSON body, not SSE.
+            bail!("provider HTTP {status}: {}", &text[..text.len().min(2000)]);
         }
-        let has_tool_call = content
-            .iter()
-            .any(|c| c.get("type").and_then(Value::as_str) == Some("toolCall"));
-        let stop_reason = if has_tool_call {
-            "toolUse"
-        } else if resp["status"].as_str() == Some("incomplete") {
-            "length"
-        } else {
-            "stop"
-        };
-        Ok(Completion {
-            content,
-            stop_reason: stop_reason.to_string(),
-            usage: normalize_openai_usage(&resp["usage"]),
-        })
+        let resp = parse_sse_final_response(&text)?;
+        Ok(completion_from_responses(&resp))
     }
 
     // ---------- anthropic-messages (POST {baseUrl}/v1/messages) ----------
@@ -443,6 +414,99 @@ async fn check(resp: reqwest::Response) -> Result<Value> {
     serde_json::from_str(&text).context("provider returned non-JSON body")
 }
 
+/// Parse an openai-responses SSE stream and return the FULL final response
+/// object. The stream is a sequence of `data: {json}` lines; each JSON event
+/// carries its own `type`. The terminal event
+/// (`response.completed`/`response.incomplete`) nests the complete response
+/// under `response`, so we don't need to reassemble per-token deltas — we just
+/// return that object for the shared parser. `response.failed`/`error` events
+/// surface the upstream error instead.
+fn parse_sse_final_response(sse: &str) -> Result<Value> {
+    let mut final_response: Option<Value> = None;
+    for line in sse.lines() {
+        let line = line.trim_start();
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(payload) else {
+            continue; // ignore keep-alive / non-JSON frames
+        };
+        match ev.get("type").and_then(Value::as_str) {
+            Some("response.completed") | Some("response.incomplete") => {
+                if let Some(r) = ev.get("response") {
+                    final_response = Some(r.clone());
+                }
+            }
+            Some("response.failed") => {
+                let msg = ev
+                    .pointer("/response/error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "response.failed".into());
+                bail!("provider stream failed: {msg}");
+            }
+            Some("error") => {
+                bail!("provider stream error: {}", &payload[..payload.len().min(500)]);
+            }
+            _ => {}
+        }
+    }
+    final_response.context("responses stream ended without a terminal response event")
+}
+
+/// Build a `Completion` from a full openai-responses response object (the
+/// `output[]` items, `usage`, and `status`). Shared by the streaming path and
+/// reusable for a non-streaming reply — both have the identical shape.
+fn completion_from_responses(resp: &Value) -> Completion {
+    let empty = vec![];
+    let mut content = Vec::new();
+    for item in resp["output"].as_array().unwrap_or(&empty) {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for c in item["content"].as_array().unwrap_or(&empty) {
+                    if c.get("type").and_then(Value::as_str) == Some("output_text") {
+                        content.push(json!({"type":"text","text":c["text"]}));
+                    }
+                }
+            }
+            Some("reasoning") => {
+                content.push(json!({
+                    "type":"thinking","thinking":"",
+                    "thinkingSignature": serde_json::to_string(item).unwrap_or_default(),
+                }));
+            }
+            Some("function_call") => {
+                let args = item["arguments"].as_str().unwrap_or("{}");
+                content.push(json!({
+                    "type":"toolCall",
+                    "id": item["call_id"],
+                    "name": item["name"],
+                    "arguments": serde_json::from_str::<Value>(args).unwrap_or(json!({})),
+                }));
+            }
+            _ => {}
+        }
+    }
+    let has_tool_call = content
+        .iter()
+        .any(|c| c.get("type").and_then(Value::as_str) == Some("toolCall"));
+    let stop_reason = if has_tool_call {
+        "toolUse"
+    } else if resp["status"].as_str() == Some("incomplete") {
+        "length"
+    } else {
+        "stop"
+    };
+    Completion {
+        content,
+        stop_reason: stop_reason.to_string(),
+        usage: normalize_openai_usage(&resp["usage"]),
+    }
+}
+
 fn content_parts(m: &Value) -> Vec<Value> {
     m.get("content")
         .and_then(Value::as_array)
@@ -523,4 +587,74 @@ fn normalize_openai_usage(u: &Value) -> Value {
         "cacheWrite": 0,
         "totalTokens": input + output + cache_read,
     })
+}
+
+#[cfg(test)]
+mod responses_tests {
+    use super::{completion_from_responses, parse_sse_final_response};
+    use serde_json::json;
+
+    // A minimal but realistic openai-responses SSE stream: deltas we ignore
+    // plus the terminal response.completed that carries the full object.
+    const SSE: &str = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"GPT\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"55_OK\"}\n\n",
+        ": keep-alive\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+        "\"output\":[{\"type\":\"reasoning\",\"summary\":[]},",
+        "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"GPT55_OK\"}]}],",
+        "\"usage\":{\"input_tokens\":29,\"output_tokens\":42,\"total_tokens\":71}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[test]
+    fn stream_terminal_event_is_parsed() {
+        let resp = parse_sse_final_response(SSE).expect("should find terminal event");
+        assert_eq!(resp["status"], "completed");
+        let c = completion_from_responses(&resp);
+        // text assembled from the terminal object, tool-free → stop
+        let text: String = c
+            .content
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect();
+        assert_eq!(text, "GPT55_OK");
+        assert_eq!(c.stop_reason, "stop");
+        assert_eq!(c.usage["totalTokens"], json!(71));
+        // reasoning item mapped to a thinking part
+        assert!(c.content.iter().any(|p| p["type"] == "thinking"));
+    }
+
+    #[test]
+    fn function_call_maps_to_toolcall_and_stops_on_touse() {
+        let resp = json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_abc",
+                "name": "read",
+                "arguments": "{\"path\":\"~/x.py\"}"
+            }],
+            "usage": {"input_tokens":1,"output_tokens":2,"total_tokens":3}
+        });
+        let c = completion_from_responses(&resp);
+        assert_eq!(c.stop_reason, "toolUse");
+        let tc = c.content.iter().find(|p| p["type"] == "toolCall").unwrap();
+        assert_eq!(tc["name"], "read");
+        assert_eq!(tc["arguments"]["path"], "~/x.py");
+    }
+
+    #[test]
+    fn incomplete_status_maps_to_length() {
+        let sse = "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"output\":[],\"usage\":{}}}\n\n";
+        let resp = parse_sse_final_response(sse).unwrap();
+        assert_eq!(completion_from_responses(&resp).stop_reason, "length");
+    }
+
+    #[test]
+    fn missing_terminal_event_errors() {
+        assert!(parse_sse_final_response("data: {\"type\":\"response.created\"}\n\n").is_err());
+    }
 }
