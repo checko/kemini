@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct CronStore {
     conn: Connection,

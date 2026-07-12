@@ -10,7 +10,6 @@ use serde_json::{json, Map, Value};
 
 #[derive(Debug, Clone)]
 pub struct ModelTarget {
-    pub provider_name: String,
     pub base_url: String,
     pub api: String,
     pub api_key: Option<String>,

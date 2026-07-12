@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 
 pub struct AgentRun<'a> {
     pub config: &'a Config,
-    pub agent_id: String,
     pub session_key: String,
     pub store: &'a mut SessionStore,
     pub transcript: &'a mut Transcript,
@@ -54,7 +53,6 @@ pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
         std::env::var(&env_name).ok().filter(|v| !v.is_empty())
     });
     Ok(ModelTarget {
-        provider_name: provider_name.to_string(),
         base_url: provider
             .base_url
             .clone()

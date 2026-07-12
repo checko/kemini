@@ -455,7 +455,6 @@ impl Runtime {
         let context_cap = compaction::context_cap(self, &chain[0]);
         let mut run = agent::AgentRun {
             config: &self.loaded.config,
-            agent_id: self.agent_id.clone(),
             session_key: session_key.to_string(),
             store: &mut store,
             transcript: &mut transcript,

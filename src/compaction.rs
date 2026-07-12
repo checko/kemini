@@ -7,8 +7,10 @@
 //!    firstKeptEntryId=null, tokensBefore) + compactionCount bump
 //!
 //! Trigger: after each turn when the last completion's context tokens exceed
-//! 80% of the model's contextWindow (or `contextTokens` when smaller).
-//! `KEMINI_COMPACT_MAX_CONTEXT=<tokens>` overrides the cap for testing.
+//! 80% of the model's USABLE input window — `contextWindow − maxTokens`
+//! (floored at half the window), so the output budget is always reserved.
+//! `KEMINI_COMPACT_MAX_CONTEXT=<tokens>` pins the cap lower (for small local
+//! models / testing).
 
 use crate::providers::LlmClient;
 use crate::Runtime;

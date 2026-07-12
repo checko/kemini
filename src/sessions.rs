@@ -278,6 +278,10 @@ impl Transcript {
 #[derive(Debug, Default)]
 pub struct LoadedContext {
     pub messages: Vec<Value>,
+    /// The most recent compaction summary, if any. Part of the loaded-context
+    /// contract and asserted in tests; production reads the summary via the
+    /// injected `messages` instead, so it is not otherwise consumed.
+    #[allow(dead_code)]
     pub summary: Option<String>,
     pub compaction_count: usize,
 }
