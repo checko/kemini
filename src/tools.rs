@@ -289,10 +289,12 @@ impl ToolRuntime {
     }
 
     fn read(&self, args: &Value) -> Result<(Value, bool)> {
-        let Some(p) = args.get("path").and_then(Value::as_str) else {
-            return Ok((json!({"error":"missing path"}), true));
+        let Some(p) = arg_str(args, PATH_KEYS) else {
+            return Ok((json!({"error":
+                "read requires a non-empty \"path\". Example: {\"path\": \"~/myfilebrowser/main.py\"}. \
+                 You called read with no usable path — supply the actual file path this time."}), true));
         };
-        let resolved = self.resolve(p);
+        let resolved = self.resolve(&p);
         if resolved.is_dir() {
             // Reading a directory: return its listing instead of a cryptic
             // EISDIR — models often probe folders through `read`.
@@ -404,11 +406,18 @@ impl ToolRuntime {
 
     fn write(&self, args: &Value) -> Result<(Value, bool)> {
         let (Some(p), Some(content)) = (
-            args.get("path").and_then(Value::as_str),
-            args.get("content").and_then(Value::as_str),
+            arg_str(args, PATH_KEYS),
+            args.get("content")
+                .or_else(|| args.get("text"))
+                .or_else(|| args.get("data"))
+                .and_then(Value::as_str),
         ) else {
-            return Ok((json!({"error":"missing path/content"}), true));
+            return Ok((json!({"error":
+                "write requires \"path\" and \"content\". Example: \
+                 {\"path\": \"~/proj/main.py\", \"content\": \"...file text...\"}. \
+                 Supply both, with the full file text in content."}), true));
         };
+        let p = p.as_str();
         let path = self.resolve(p);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -423,12 +432,16 @@ impl ToolRuntime {
 
     fn edit(&self, args: &Value) -> Result<(Value, bool)> {
         let (Some(p), Some(old), Some(new)) = (
-            args.get("path").and_then(Value::as_str),
-            args.get("oldText").and_then(Value::as_str),
-            args.get("newText").and_then(Value::as_str),
+            arg_str(args, PATH_KEYS),
+            arg_str(args, &["oldText", "old_text", "old_string", "old", "search"]),
+            arg_str(args, &["newText", "new_text", "new_string", "new", "replace", "replacement"]),
         ) else {
-            return Ok((json!({"error":"edit requires path, oldText, newText"}), true));
+            return Ok((json!({"error":
+                "edit requires \"path\", \"oldText\", \"newText\". Example: \
+                 {\"path\": \"~/proj/utils.py\", \"oldText\": \"exact old snippet\", \
+                 \"newText\": \"replacement\"}. Read the file first and copy oldText verbatim."}), true));
         };
+        let (p, old, new) = (p.as_str(), old.as_str(), new.as_str());
         let path = self.resolve(p);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -503,9 +516,10 @@ impl ToolRuntime {
     }
 
     fn memory_get(&self, args: &Value) -> Result<(Value, bool)> {
-        let Some(p) = args.get("path").and_then(Value::as_str) else {
-            return Ok((json!({"error":"missing path"}), true));
+        let Some(p) = arg_str(args, PATH_KEYS) else {
+            return Ok((json!({"error":"memory_get requires a \"path\" (e.g. MEMORY.md)"}), true));
         };
+        let p = p.as_str();
         let from = args.get("from").and_then(Value::as_u64).map(|v| v as usize);
         let lines = args.get("lines").and_then(Value::as_u64).map(|v| v as usize);
         let mem = self.memory.lock().unwrap();
@@ -732,6 +746,49 @@ impl ToolRuntime {
             Ok(v) => Ok((v, false)),
             Err(e) => Ok((json!({"error": format!("{e:#}")}), true)),
         }
+    }
+}
+
+/// Pull a string argument, accepting common key aliases. Weak local models
+/// trained on other harnesses routinely pass `file_path`/`file` instead of
+/// `path`, or `old_string`/`new_string` instead of `oldText`/`newText`; a
+/// bare key-name mismatch otherwise wedges the whole turn on "missing path".
+/// A JSON number is also accepted and stringified (models sometimes quote or
+/// unquote numeric-looking values inconsistently).
+fn arg_str<'a>(args: &'a Value, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        match args.get(*k) {
+            Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
+            Some(Value::Number(n)) => return Some(n.to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "file", "filename", "fileName"];
+
+#[cfg(test)]
+mod arg_tests {
+    use super::{arg_str, PATH_KEYS};
+    use serde_json::json;
+
+    #[test]
+    fn path_aliases_and_number_coercion() {
+        assert_eq!(arg_str(&json!({"path": "a.py"}), PATH_KEYS).as_deref(), Some("a.py"));
+        // model used file_path (Claude-Code convention) — must still resolve
+        assert_eq!(arg_str(&json!({"file_path": "b.py"}), PATH_KEYS).as_deref(), Some("b.py"));
+        assert_eq!(arg_str(&json!({"file": "c.py"}), PATH_KEYS).as_deref(), Some("c.py"));
+        // empty string is treated as absent so we emit the instructive error
+        assert_eq!(arg_str(&json!({"path": ""}), PATH_KEYS), None);
+        assert_eq!(arg_str(&json!({}), PATH_KEYS), None);
+        // numeric value stringified
+        assert_eq!(arg_str(&json!({"path": 12}), PATH_KEYS).as_deref(), Some("12"));
+        // first matching key wins
+        assert_eq!(
+            arg_str(&json!({"path": "x", "file_path": "y"}), PATH_KEYS).as_deref(),
+            Some("x")
+        );
     }
 }
 

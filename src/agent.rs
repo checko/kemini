@@ -113,6 +113,16 @@ impl<'a> AgentRun<'a> {
         let mut verified_since_edit = false;
         let mut verify_nudges = 0usize;
         let mut mid_turn_compactions = 0usize;
+        // Loop-breaker for weak local models: a 9B model that loses track of a
+        // task falls into emitting the SAME failing tool call over and over —
+        // observed live as `read {}` / `write {}` with empty arguments spun
+        // ~15× until max_turns, producing garbage and never replying. Track
+        // consecutive errored tool calls; send one forceful correction, then
+        // abort the turn with an honest message rather than spin.
+        let mut consec_tool_errors = 0usize;
+        let mut correction_sent = false;
+        const TOOL_ERROR_CORRECTION_AT: usize = 3;
+        const TOOL_ERROR_ABORT_AT: usize = 6;
 
         'outer: for _ in 0..self.max_turns {
             // Mid-turn compaction (Hermes layer 2): a long tool loop grows
@@ -230,6 +240,14 @@ impl<'a> AgentRun<'a> {
                     Ok(r) => r,
                     Err(e) => (json!({"error": format!("{e:#}")}), true),
                 };
+                // Loop-breaker bookkeeping: count consecutive errored tool
+                // calls; any successful call clears it and re-arms correction.
+                if is_error {
+                    consec_tool_errors += 1;
+                } else {
+                    consec_tool_errors = 0;
+                    correction_sent = false;
+                }
                 // Track code edits vs verification for verify-on-stop.
                 if !is_error {
                     match name {
@@ -268,6 +286,39 @@ impl<'a> AgentRun<'a> {
                 }
                 self.transcript.append_message(result_msg.clone())?;
                 history.push(result_msg);
+            }
+
+            // Loop-breaker decision, evaluated once per assistant turn after
+            // its tool results are in. A weak model stuck repeating a failing
+            // call gets ONE forceful correction; if it keeps failing, abort
+            // with an honest reply instead of spinning to max_turns.
+            if consec_tool_errors >= TOOL_ERROR_ABORT_AT {
+                tracing::warn!(
+                    "aborting turn: {consec_tool_errors} consecutive tool errors for {}",
+                    self.session_key
+                );
+                final_text = format!(
+                    "I got stuck — my last {consec_tool_errors} tool calls failed in a row \
+                     (usually malformed arguments or a wrong path), and I couldn't make \
+                     progress on: \"{user_goal}\". Nothing was changed in this attempt. \
+                     Please re-check the path/task or restate it, and I'll try again."
+                );
+                break 'outer;
+            }
+            if consec_tool_errors >= TOOL_ERROR_CORRECTION_AT && !correction_sent {
+                correction_sent = true;
+                history.push(json!({
+                    "role": "user",
+                    "content": [{"type":"text","text": format!(
+                        "STOP. Your last {consec_tool_errors} tool calls failed — you are \
+                         repeating a call with missing or wrong arguments. Do not repeat the \
+                         same call. Read the error text above: it names the exact required \
+                         parameters and shows an example. Make ONE corrected tool call with \
+                         every required field filled in with real values (e.g. a concrete \
+                         file path). If you cannot proceed, stop and say plainly what is \
+                         blocking you.")}],
+                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                }));
             }
         }
 
