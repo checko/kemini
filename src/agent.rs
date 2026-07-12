@@ -112,6 +112,7 @@ impl<'a> AgentRun<'a> {
         let mut edited_code = false;
         let mut verified_since_edit = false;
         let mut verify_nudges = 0usize;
+        let mut empty_reply_nudges = 0usize;
         let mut mid_turn_compactions = 0usize;
         // Loop-breaker for weak local models: a 9B model that loses track of a
         // task falls into emitting the SAME failing tool call over and over —
@@ -181,6 +182,16 @@ impl<'a> AgentRun<'a> {
                 .cloned()
                 .collect();
 
+            // Did THIS completion carry a non-empty visible text answer?
+            // (thinking/reasoning parts don't count — they're never shown to
+            // the user.) Tracked separately from `final_text`, which persists
+            // across loop iterations.
+            let has_visible_text = completion.content.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some("text")
+                    && c.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| !t.trim().is_empty())
+            });
             for c in completion.content.iter() {
                 if c.get("type").and_then(Value::as_str) == Some("text") {
                     if let Some(t) = c.get("text").and_then(Value::as_str) {
@@ -190,6 +201,30 @@ impl<'a> AgentRun<'a> {
             }
 
             if tool_calls.is_empty() {
+                // Empty-reply guard (the "done (no text output)" fix): the
+                // model ended its turn with no tool call AND no visible text —
+                // e.g. a thinking model that reasoned in the reasoning channel
+                // ("let me search memory… now I should use exec…") then stopped
+                // without emitting the tool call or an answer. An empty reply is
+                // never a valid finished turn: nudge it to actually act or
+                // answer. Model-agnostic, so it catches cases the keyword-based
+                // `looks_unfinished` can't (there is no text to match on).
+                if !has_visible_text && empty_reply_nudges < 2 {
+                    empty_reply_nudges += 1;
+                    let nudge = json!({
+                        "role": "user",
+                        "content": [{"type":"text","text":
+                            "You ended your turn with no reply at all — only internal reasoning, no \
+                             visible answer and no tool call. Your thinking is not shown to the user. \
+                             Now do ONE of these: (a) if you need information, call the tool you were \
+                             about to use (e.g. exec/read/memory_search) with real arguments, or (b) \
+                             write the actual answer to the user as normal text. Do not end your turn \
+                             empty again."}],
+                        "timestamp": chrono::Utc::now().timestamp_millis(),
+                    });
+                    history.push(nudge);
+                    continue 'outer;
+                }
                 // Continuation nudge: weak models stop mid-task, e.g. "Step 1
                 // done, now verifying before continuing" — with NO tool call.
                 // Fire when the reply signals more work is coming (intent or

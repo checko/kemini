@@ -359,10 +359,19 @@ async fn handle_turn(
                 }
             }
         }
-        // Tools ran but the model produced no final text: say so instead of
-        // silence (silence is indistinguishable from a hang for the user).
+        // The turn finished with no visible text. After the agent's
+        // empty-reply nudges this is rare, but if it still happens the model
+        // reasoned without ever answering — tell the user honestly and invite
+        // a retry rather than the opaque "done (no text output)".
         Ok(_) => {
-            let _ = send_message(http, base, chat_id, "✅ done (no text output)").await;
+            let _ = send_message(
+                http,
+                base,
+                chat_id,
+                "⚠️ I didn't produce a reply that time — I may have reasoned without \
+                 finishing the answer. Please ask again or rephrase.",
+            )
+            .await;
         }
         Err(e) => {
             let _ = send_message(http, base, chat_id, &format!("⚠️ error: {e:#}")).await;
