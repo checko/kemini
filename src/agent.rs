@@ -124,6 +124,11 @@ impl<'a> AgentRun<'a> {
         let mut correction_sent = false;
         const TOOL_ERROR_CORRECTION_AT: usize = 3;
         const TOOL_ERROR_ABORT_AT: usize = 6;
+        // Distinguish a natural finish / deliberate abort (both `break 'outer`)
+        // from running out of the turn budget. If the loop exhausts
+        // `max_turns` it paused MID-TASK — we tell the user so "continue" is an
+        // obvious next step instead of a dangling "now let me run the tests…".
+        let mut ran_to_limit = true;
 
         'outer: for _ in 0..self.max_turns {
             // Mid-turn compaction (Hermes layer 2): a long tool loop grows
@@ -262,6 +267,7 @@ impl<'a> AgentRun<'a> {
                     history.push(nudge);
                     continue 'outer;
                 }
+                ran_to_limit = false; // model finished on its own
                 break 'outer;
             }
 
@@ -338,6 +344,7 @@ impl<'a> AgentRun<'a> {
                      progress on: \"{user_goal}\". Nothing was changed in this attempt. \
                      Please re-check the path/task or restate it, and I'll try again."
                 );
+                ran_to_limit = false; // deliberate abort; has its own message
                 break 'outer;
             }
             if consec_tool_errors >= TOOL_ERROR_CORRECTION_AT && !correction_sent {
@@ -371,6 +378,33 @@ impl<'a> AgentRun<'a> {
             }),
         );
         self.store.save()?;
+
+        // Turn budget exhausted: the model was still working when it hit
+        // `max_turns`, so its last text is an intermediate step, not a
+        // conclusion (observed live: hy3 announced "now let me run the full
+        // test suite", the loop ended right after, and the user saw a
+        // dangling promise). Tell the user it paused so "continue" is obvious.
+        // This is appended to the RETURNED reply only — the transcript already
+        // holds the raw assistant messages, so the next "continue" turn reads
+        // a clean history.
+        if ran_to_limit {
+            tracing::info!(
+                "turn hit max_turns={} for {} — paused mid-task",
+                self.max_turns,
+                self.session_key
+            );
+            let note = format!(
+                "⏳ I paused after {} steps (my per-message limit) and I'm not done yet — \
+                 reply \"continue\" and I'll pick up where I left off.",
+                self.max_turns
+            );
+            if final_text.trim().is_empty() {
+                final_text = note;
+            } else {
+                final_text.push_str("\n\n");
+                final_text.push_str(&note);
+            }
+        }
         Ok(final_text)
     }
 
