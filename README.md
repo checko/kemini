@@ -51,6 +51,33 @@ cargo build --release
 `OPENCLAW_STATE_DIR=/path/to/state` overrides the state dir (useful for testing
 against a copy before pointing it at the real one).
 
+### Console interaction (`kemini chat`)
+
+You can operate kemini entirely from the terminal, no Telegram needed:
+
+```bash
+kemini chat                 # interactive REPL
+kemini chat --new           # start a fresh session
+kemini chat --model ollama-localhost/ornith-1.0-9b-q4
+```
+
+The REPL is a line loop — it prints `you>`, you type, it prints `agent>` with
+the reply. In-REPL commands: `/new` or `/reset` (start a fresh session on the
+next message), `/quit` or `/exit`. It runs on the **main session** — the *same*
+conversation as your Telegram channel — so history is shared between console
+and Telegram. For a single message without staying in the loop, use
+`kemini agent -m "…"` (also resumes the main session).
+
+This is a plain readline REPL, **not** a full-screen TUI like openclaw's
+`tui`/`chat`: replies print when complete (no token streaming), and the only
+in-chat commands are `/new` `/reset` `/quit` `/exit` (model/status/etc. are
+separate CLI subcommands, and cron/subagents have `kemini watch` — see below).
+
+> **Caveat:** `kemini chat` and a running `kemini telegram` daemon both write
+> the main session with no cross-process lock. Chatting in the console and over
+> Telegram at the same instant can interleave turns — use one at a time, or
+> stop the daemon while using `kemini chat`.
+
 ### Running fully local (sensitive data)
 
 kemini can run entirely offline against a local Ollama model so sensitive
