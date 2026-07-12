@@ -135,6 +135,27 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(text, id UNINDEXED, path UNINDEXED,
 With `agents.defaults.memorySearch.provider: "none"` search is FTS/keyword-only —
 embeddings are stored as JSON-in-TEXT when a provider is configured.
 
+**The markdown files are the source of truth; this SQLite is a derived index.**
+npm's memory-core watches `workspace/MEMORY.md` and the `workspace/memory/`
+directory for `*.md` files, tracks each file's mtime+hash, and (re)chunks
+changed files into the index (upstream
+`extensions/memory-core/src/memory/manager-sync-ops.ts`: `.md`-only ingest,
+`MEMORY.md` watch path, per-file mtime/hash; chunk size/overlap 400/80). kemini
+does the same (`src/memory.rs` indexes `MEMORY.md` + `memory/**`, hash-gated).
+Because the index is *derived*, kemini and npm interoperate through the `.md`
+files, not by sharing the DB: whichever runs re-indexes anything changed.
+
+Storage-location caveat (npm version drift): the `chunks/files/meta/chunks_fts`
+schema above lives in the standalone sidecar `memory/<agentId>.sqlite` — the
+location kemini reads/writes. Newer npm (2026.6.10) migrated its live index
+INTO the agent DB `agents/<id>/agent/openclaw-agent.sqlite` under prefixed
+tables (`memory_index_chunks`, `memory_index_meta`, `memory_index_sources`, …)
+and imports the legacy sidecar on startup (upstream
+`extensions/memory-core/doctor-contract-api.ts`: legacy path
+`<state>/memory/<agentId>.sqlite`, `import_legacy_sidecar_memory_index`). kemini
+does NOT read those `memory_index_*` tables — it uses the legacy sidecar — but
+memory stays shared via the markdown regardless.
+
 ## System prompt bootstrap injection
 
 Files injected in order (npm `CONTEXT_FILE_ORDER`): AGENTS.md, SOUL.md,
