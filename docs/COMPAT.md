@@ -148,5 +148,8 @@ memory_search/memory_get; recent daily notes may be prepended one-shot after
 
 ## Gateway
 
-`gateway.port` (default 18789), bind loopback, token auth
-(`gateway.auth.token`, bearer). WebSocket protocol used by Control UI/webchat.
+`gateway.port` — a single multiplexed port for the Gateway WS + HTTP
+(default **18789**; `--dev` mode isolates state under `~/.openclaw-dev` and
+uses 19001). Bind loopback, token auth (`gateway.auth.token`, bearer).
+WebSocket protocol used by Control UI/webchat. (Verified against npm openclaw
+2026.6.10: `gateway.port ?? 18789` and the `port` type default.)
