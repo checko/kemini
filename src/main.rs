@@ -222,7 +222,7 @@ impl Runtime {
     }
 
     pub fn model_chain(&self, override_ref: Option<&str>) -> Vec<String> {
-        if let Some(m) = override_ref {
+        if let Some(m) = override_ref.map(str::trim).filter(|s| !s.is_empty()) {
             return vec![m.to_string()];
         }
         let cfg = &self.loaded.config;

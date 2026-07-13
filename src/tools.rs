@@ -626,8 +626,12 @@ impl ToolRuntime {
             return Ok((json!({"error":"missing task"}), true));
         };
         // Child inherits the parent's active model unless explicitly overridden.
+        // Weak models often emit `"model": ""` (or whitespace); treat that as
+        // "no override" rather than passing an empty ref that fails to resolve.
         let model = args["model"]
             .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .map(String::from)
             .unwrap_or_else(|| self.session.model_ref.clone());
         match crate::subagents::spawn(
