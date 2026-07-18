@@ -16,6 +16,30 @@ pub struct ModelTarget {
     pub auth_header: bool,
     pub model_id: String,
     pub max_tokens: u64,
+    /// Reasoning effort to request for reasoning-capable models
+    /// ("minimal"|"low"|"medium"|"high"|...). `None` => omit the reasoning
+    /// param entirely (non-reasoning model, or effort disabled).
+    pub reasoning_effort: Option<String>,
+}
+
+/// Default reasoning effort for a reasoning-capable model, mirroring openclaw's
+/// OpenAI thinking-policy: the GPT-5.6 family (Sol/Terra/Luna) reasons at
+/// `medium` by default. openclaw shipped `fix(openai): default Sol reasoning to
+/// medium` (was `low`); this tracks that. Models with no family default return
+/// `None` so we leave the reasoning param off and let the endpoint decide.
+pub fn default_reasoning_effort(model_id: &str) -> Option<&'static str> {
+    let id = model_id.trim().to_ascii_lowercase();
+    let is_sol_terra_luna = id == "gpt-5.6-sol"
+        || id == "gpt-5.6-terra"
+        || id == "gpt-5.6-luna"
+        || id.starts_with("gpt-5.6-sol")
+        || id.starts_with("gpt-5.6-terra")
+        || id.starts_with("gpt-5.6-luna");
+    if is_sol_terra_luna {
+        Some("medium")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,6 +163,11 @@ impl LlmClient {
                 }))
                 .collect::<Vec<_>>());
         }
+        // Chat-completions reasoning models take a flat `reasoning_effort`
+        // string (openclaw parity). Omitted when no effort is set.
+        if let Some(effort) = t.reasoning_effort.as_deref().filter(|e| *e != "none") {
+            body["reasoning_effort"] = json!(effort);
+        }
 
         let url = format!("{}/chat/completions", t.base_url.trim_end_matches('/'));
         tracing::debug!(
@@ -215,21 +244,46 @@ impl LlmClient {
                     input.push(json!({"role": "user", "content": parts}));
                 }
                 Some("assistant") => {
-                    let text = flatten_text(m);
-                    if !text.is_empty() {
-                        input.push(json!({
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}],
-                        }));
-                    }
+                    // Replay parts IN ORDER so reasoning items sit before the
+                    // function_call they produced, and each function_call keeps
+                    // its Responses item `id` — both required for stateful
+                    // (store:false) reasoning endpoints to thread tool calls.
                     for c in content_parts(m) {
-                        if c.get("type").and_then(Value::as_str) == Some("toolCall") {
-                            input.push(json!({
-                                "type": "function_call",
-                                "call_id": primary_call_id(c.get("id")),
-                                "name": c.get("name"),
-                                "arguments": serde_json::to_string(c.get("arguments").unwrap_or(&Value::Null)).unwrap(),
-                            }));
+                        match c.get("type").and_then(Value::as_str) {
+                            Some("thinking") => {
+                                if let Some(item) = reasoning_replay_item(&c) {
+                                    input.push(item);
+                                }
+                            }
+                            Some("text") => {
+                                let text = c.get("text").and_then(Value::as_str).unwrap_or_default();
+                                if !text.is_empty() {
+                                    input.push(json!({
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": text}],
+                                    }));
+                                }
+                            }
+                            Some("toolCall") => {
+                                let mut fc = json!({
+                                    "type": "function_call",
+                                    "call_id": primary_call_id(c.get("id")),
+                                    "name": c.get("name"),
+                                    "arguments": serde_json::to_string(c.get("arguments").unwrap_or(&Value::Null)).unwrap(),
+                                });
+                                // The compound id is `call_id|item_id`; replay
+                                // the item id when present.
+                                if let Some(item_id) = c
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .and_then(|s| s.split('|').nth(1))
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    fc["id"] = json!(item_id);
+                                }
+                                input.push(fc);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -266,6 +320,18 @@ impl LlmClient {
                 }))
                 .collect::<Vec<_>>());
         }
+        // Reasoning-capable models (e.g. GPT-5.6-Sol) take a `reasoning` block.
+        // Mirrors openclaw's Responses transport: `{effort, summary:"auto"}`
+        // plus `include:["reasoning.encrypted_content"]` so encrypted thinking
+        // is returned. Omitted entirely when no effort is set.
+        if let Some(effort) = t.reasoning_effort.as_deref().filter(|e| *e != "none") {
+            body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        tracing::debug!(
+            "responses request to {}: model={} reasoning_effort={:?}",
+            t.base_url, t.model_id, body.get("reasoning").and_then(|r| r.get("effort"))
+        );
         let url = format!("{}/responses", t.base_url.trim_end_matches('/'));
         let mut req = self.http.post(&url).json(&body);
         if let Some(k) = &t.api_key {
@@ -479,9 +545,19 @@ fn completion_from_responses(resp: &Value) -> Completion {
             }
             Some("function_call") => {
                 let args = item["arguments"].as_str().unwrap_or("{}");
+                // Preserve BOTH the wire `call_id` and the Responses item `id`
+                // (fc_...) as a compound `call_id|item_id`. The item id must be
+                // replayed to stateful (store:false) reasoning endpoints or the
+                // model never registers its call was answered and loops on the
+                // same tool call. primary_call_id() strips it back for matching.
+                let call_id = item["call_id"].as_str().unwrap_or_default();
+                let compound = match item["id"].as_str() {
+                    Some(fc) if !fc.is_empty() => format!("{call_id}|{fc}"),
+                    _ => call_id.to_string(),
+                };
                 content.push(json!({
                     "type":"toolCall",
-                    "id": item["call_id"],
+                    "id": compound,
                     "name": item["name"],
                     "arguments": serde_json::from_str::<Value>(args).unwrap_or(json!({})),
                 }));
@@ -553,6 +629,23 @@ fn tool_result_text(m: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Rebuild a Responses `reasoning` input item from a stored thinking part for
+/// replay. The `thinkingSignature` holds the verbatim reasoning item JSON we
+/// captured from the response (type/id/encrypted_content). Replaying it keeps
+/// stateful reasoning models' chain-of-thought across tool calls (openclaw
+/// `replayReasoningItems`); `summary` is emptied to match openclaw's replay.
+/// Returns None for thinking parts without a parseable reasoning-item signature
+/// (e.g. completions/anthropic thinking), which are simply not replayed.
+fn reasoning_replay_item(part: &Value) -> Option<Value> {
+    let sig = part.get("thinkingSignature").and_then(Value::as_str)?;
+    let mut item: Value = serde_json::from_str(sig).ok()?;
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return None;
+    }
+    item["summary"] = json!([]);
+    Some(item)
+}
+
 /// Transcript tool-call ids can be compound (`call_x|fc_y` observed live when
 /// two upstream ids exist); the wire protocol wants the first component.
 fn primary_call_id(v: Option<&Value>) -> String {
@@ -586,6 +679,27 @@ fn normalize_openai_usage(u: &Value) -> Value {
         "cacheWrite": 0,
         "totalTokens": input + output + cache_read,
     })
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::default_reasoning_effort;
+
+    #[test]
+    fn gpt_5_6_family_defaults_to_medium() {
+        assert_eq!(default_reasoning_effort("gpt-5.6-sol"), Some("medium"));
+        assert_eq!(default_reasoning_effort("gpt-5.6-terra"), Some("medium"));
+        assert_eq!(default_reasoning_effort("gpt-5.6-luna"), Some("medium"));
+        // case/whitespace tolerant
+        assert_eq!(default_reasoning_effort("  GPT-5.6-Sol  "), Some("medium"));
+    }
+
+    #[test]
+    fn other_models_have_no_family_default() {
+        assert_eq!(default_reasoning_effort("gpt-5.5"), None);
+        assert_eq!(default_reasoning_effort("gpt-5.6"), None); // bare model: endpoint decides
+        assert_eq!(default_reasoning_effort("ornith-1.0-9b-q4"), None);
+    }
 }
 
 #[cfg(test)]

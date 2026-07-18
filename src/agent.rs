@@ -52,6 +52,19 @@ pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
         );
         std::env::var(&env_name).ok().filter(|v| !v.is_empty())
     });
+    // Reasoning effort: only for models the config marks `reasoning: true`.
+    // `KEMINI_REASONING_EFFORT` overrides for testing ("none"/"off" disables);
+    // otherwise fall back to the model-family default (GPT-5.6 => medium).
+    let reasoning_effort = if entry.and_then(|m| m.reasoning).unwrap_or(false) {
+        match std::env::var("KEMINI_REASONING_EFFORT").ok().map(|s| s.trim().to_string()) {
+            Some(s) if s.is_empty() => crate::providers::default_reasoning_effort(model_id).map(String::from),
+            Some(s) if s == "off" => None,
+            Some(s) => Some(s),
+            None => crate::providers::default_reasoning_effort(model_id).map(String::from),
+        }
+    } else {
+        None
+    };
     Ok(ModelTarget {
         base_url: provider
             .base_url
@@ -62,6 +75,7 @@ pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
         auth_header: provider.auth_header.unwrap_or(false),
         model_id: model_id.to_string(),
         max_tokens: entry.and_then(|m| m.max_tokens).unwrap_or(4096),
+        reasoning_effort,
     })
 }
 
