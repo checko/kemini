@@ -31,8 +31,23 @@ pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
     let Some((provider_name, model_id)) = crate::config::split_model_ref(model_ref) else {
         bail!("invalid model ref: {model_ref}");
     };
-    let Some(provider) = config.models.providers.get(provider_name) else {
-        bail!("provider not found in config: {provider_name}");
+    // `anthropic` is a built-in provider in openclaw — it is never written to
+    // openclaw.json (the direct endpoint + auth come from the claude-cli auth
+    // profile). Synthesize that default so configs referencing anthropic/claude-*
+    // (e.g. the claude-cli login's model allowlist) resolve without a provider block.
+    let builtin_anthropic;
+    let provider = match config.models.providers.get(provider_name) {
+        Some(p) => p,
+        None if provider_name == "anthropic" => {
+            builtin_anthropic = Provider {
+                base_url: Some("https://api.anthropic.com".into()),
+                api: Some("anthropic-messages".into()),
+                auth_header: Some(true),
+                ..Default::default()
+            };
+            &builtin_anthropic
+        }
+        None => bail!("provider not found in config: {provider_name}"),
     };
     let entry = find_model(provider, model_id);
     let api = entry
@@ -51,6 +66,14 @@ pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
                 .collect::<String>()
         );
         std::env::var(&env_name).ok().filter(|v| !v.is_empty())
+    })
+    .or_else(|| {
+        // Built-in anthropic with no explicit key/env: use the Claude Code
+        // subscription OAuth token from ~/.claude/.credentials.json. Read fresh
+        // each turn so a Claude Code re-login/refresh is picked up.
+        (provider_name == "anthropic")
+            .then(crate::providers::read_claude_cli_oauth_token)
+            .flatten()
     });
     // Reasoning effort: only for models the config marks `reasoning: true`.
     // `KEMINI_REASONING_EFFORT` overrides for testing ("none"/"off" disables);
@@ -74,7 +97,12 @@ pub fn resolve_target(config: &Config, model_ref: &str) -> Result<ModelTarget> {
         api_key,
         auth_header: provider.auth_header.unwrap_or(false),
         model_id: model_id.to_string(),
-        max_tokens: entry.and_then(|m| m.max_tokens).unwrap_or(4096),
+        // No explicit per-model maxTokens: anthropic gets 32_000 (openclaw's
+        // effective default cap for Claude models, `min(catalogMax, 32_000)`);
+        // every other provider keeps the conservative 4096 baseline.
+        max_tokens: entry.and_then(|m| m.max_tokens).unwrap_or(
+            if provider_name == "anthropic" { 32_000 } else { 4096 },
+        ),
         reasoning_effort,
     })
 }

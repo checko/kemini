@@ -8,6 +8,40 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
+/// Claude Code CLI version kemini masquerades as when calling the direct
+/// Anthropic endpoint with a subscription OAuth token. Anthropic's OAuth
+/// billing path expects requests shaped like Claude Code's; this mirrors the
+/// hardcoded version in openclaw's anthropic transport
+/// (`CLAUDE_CODE_VERSION` in `anthropic-transport-stream.ts`).
+const CLAUDE_CODE_VERSION: &str = "2.1.75";
+
+/// Read the Claude Code subscription OAuth access token from
+/// `~/.claude/.credentials.json` (the `claudeAiOauth` block Claude Code
+/// writes). This is the same on-disk login openclaw's `claude-cli` auth method
+/// reads; kemini reads it fresh on every resolve so a Claude Code re-login or
+/// token refresh is picked up automatically — no snapshot to go stale. Linux
+/// path only (the file); no macOS Keychain source. Returns `None` when the
+/// file or token is absent.
+pub fn read_claude_cli_oauth_token() -> Option<String> {
+    let path = dirs::home_dir()?.join(".claude").join(".credentials.json");
+    let data: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let oauth = data.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    // Claude Code keeps this file fresh; if it has lapsed we still return the
+    // token (the API surfaces a clear 401) but warn so the cause is obvious.
+    if let Some(exp) = oauth.get("expiresAt").and_then(Value::as_i64) {
+        if exp > 0 && exp < chrono::Utc::now().timestamp_millis() {
+            tracing::warn!(
+                "~/.claude/.credentials.json access token is expired; re-login in Claude Code"
+            );
+        }
+    }
+    Some(token.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelTarget {
     pub base_url: String,
@@ -400,9 +434,38 @@ impl LlmClient {
                 _ => {}
             }
         }
+        // Anthropic subscription OAuth tokens (`sk-ant-oat…`) require the
+        // Claude Code masquerade: a fixed billing+identity system preamble plus
+        // claude-cli request headers, or Anthropic rejects the request. Mirrors
+        // openclaw's `isAnthropicOAuthToken` + the OAuth branch of
+        // `buildAnthropicParams`. Gated to the direct Anthropic endpoint so a
+        // third-party anthropic-messages gateway never receives the spoof.
+        let is_oauth = t
+            .api_key
+            .as_deref()
+            .is_some_and(|k| k.contains("sk-ant-oat"));
+        let oauth_masq = is_oauth && t.base_url.contains("api.anthropic.com");
+
+        let system_value = if oauth_masq {
+            let mut blocks = vec![
+                // Anthropic requires this first block to route Claude
+                // subscription OAuth billing.
+                json!({"type":"text","text": format!(
+                    "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}; cc_entrypoint=sdk-cli;"
+                )}),
+                json!({"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}),
+            ];
+            if !system.is_empty() {
+                blocks.push(json!({"type":"text","text": system}));
+            }
+            Value::Array(blocks)
+        } else {
+            Value::String(system.to_string())
+        };
+
         let mut body = json!({
             "model": t.model_id,
-            "system": system,
+            "system": system_value,
             "messages": wire,
             "max_tokens": t.max_tokens,
         });
@@ -418,9 +481,21 @@ impl LlmClient {
             .post(&url)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
+        if oauth_masq {
+            req = req
+                .header(
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+                )
+                .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
+                .header("x-app", "cli")
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("accept", "application/json");
+        }
         if let Some(k) = &t.api_key {
-            // `authHeader: true` selects Authorization: Bearer instead of x-api-key.
-            if t.auth_header {
+            // `authHeader: true` selects Authorization: Bearer instead of
+            // x-api-key. OAuth tokens are always Bearer regardless of the flag.
+            if t.auth_header || is_oauth {
                 req = req.bearer_auth(k);
             } else {
                 req = req.header("x-api-key", k);
